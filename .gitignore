@@ -1,0 +1,48 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+*.egg-info/
+
+# Virtualenv
+.env
+env/
+.venv/
+
+# Pytest
+.cache/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+
+# Coverage
+htmlcov/
+.coverage
+.tox/
+
+# IDE/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Docker
+*.log
+docker-compose.override.yml
+
+# System
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+.env.*
+
+# Local config
+local_settings.py
