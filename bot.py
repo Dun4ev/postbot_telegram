@@ -123,7 +123,7 @@ logger.info("Таймзона запланированных публикаци�
 
 # default 5 slots/day; can override via POST_SLOTS env ("HH:MM,HH:MM,...")
 def _parse_slots_from_env() -> List[dtime]:
-    raw = os.getenv("POST_SLOTS", "10:00,13:00,16:00,23:41,23:42")
+    raw = os.getenv("POST_SLOTS", "14:30,14:31,14:32,14:33,14:34")
     slots: List[dtime] = []
     for chunk in raw.split(","):
         chunk = chunk.strip()

@@ -1,117 +1,138 @@
 # Развёртывание Postbot на Synology DSM
 
-Инструкция описывает подготовку окружения и запуск бота `postbot` на NAS Synology с DSM 7.x. Предполагается, что проект уже склонирован или синхронизирован в директорию `/volume1/docker/postbot` (скорректируйте путь под свою конфигурацию).
+Инструкция описывает подготовку окружения и запуск очереди постинга `postbot` на NAS Synology с DSM 7.x. Репозиторий предполагается размещать в каталоге `/volume1/tgqueue`. При необходимости замените путь во всех командах на свой.
 
 ## 1. Предварительные требования
 
 - Учётная запись с правами администратора на DSM.
-- Включённый доступ по SSH (DSM → «Панель управления» → «Терминал и SNMP» → «Включить службу SSH»).
-- Установленный пакет **Container Manager** (ранее Docker) для контейнерного способа, либо Python 3.11 с модулем `venv` для виртуального окружения.
-- Свежий токен Telegram-бота (`POSTBOT_TELEGRAM_TOKEN`), полученный через @BotFather.
-- Свободное место на томе, где будет храниться база `queue.db`.
+- Включённый SSH-доступ (DSM → «Панель управления» → «Терминал и SNMP» → «Включить службу SSH»).
+- Установленный **Container Manager** (ранее Docker) либо Python 3.11 с модулем `venv` — в зависимости от выбранного способа запуска.
+- Свежий токен Telegram-бота (`TG_BOT_TOKEN`), полученный через @BotFather.
+- Идентификатор канала (`TG_CHANNEL` вида `@your_channel` или `TG_CHANNEL_ID` вида `-100…`).
+- Свободное место на томе для файла очереди `queue.db` и логов.
 
-## 2. Подготовка окружения
+## 2. Подготовка каталога
 
 1. Подключитесь по SSH:
    ```bash
    ssh admin@<synology-ip>
    ```
-2. Создайте рабочую директорию (если ещё не создана):
+2. Создайте рабочую папку (если ещё не существует):
    ```bash
-   mkdir -p /volume1/docker/postbot
+   mkdir -p /volume1/tgqueue
    ```
-3. Перейдите в каталог и разместите проект:
+3. Клонируйте проект в каталог:
    ```bash
-   cd /volume1/docker/postbot
-   git clone https://<your_repo>.git .
+   cd /volume1/tgqueue
+   git clone https://github.com/Dun4ev/postbot_telegram.git .
    ```
-   Допускается синхронизация через Synology Drive или SFTP — убедитесь, что финальная структура совпадает с исходным репозиторием.
 
-## 3. Конфигурация переменных окружения
+   Допускается синхронизация через Synology Drive/SFTP. Главное — чтобы структура файлов совпадала с репозиторием.
 
-1. Создайте файл `.env` (не добавляйте в систему контроля версий):
-   ```bash
-   cat > .env <<'EOF'
-   POSTBOT_TELEGRAM_TOKEN=your-telegram-token
-   POSTBOT_DB_PATH=/data/queue.db
-   EOF
-   ```
-2. Проверьте файл `docker-compose.yml` (если используете Docker), чтобы путь `/data/queue.db` был смонтирован в контейнер. При запуске в venv укажите абсолютный путь в переменной окружения `POSTBOT_DB_PATH`.
+## 3. Переменные окружения
 
-## 4. Запуск через Docker Compose
+Создайте `.env` рядом с `docker-compose.yml`. Файл используется и Docker Compose, и Python-скриптом (через `python-dotenv`).
 
-1. Убедитесь, что сервис Docker активен:
+```bash
+cat > .env <<'EOF'
+TG_BOT_TOKEN=your-telegram-token
+# укажите одно из значений ниже
+TG_CHANNEL=@your_channel
+# TG_CHANNEL_ID=-1001234567890
+TZ=Europe/Belgrade
+# доп. параметры при необходимости
+# POST_SLOTS=10:00,13:00,16:00,19:00,22:00
+EOF
+```
+
+> `TG_CHANNEL` и `TG_CHANNEL_ID` взаимоисключающие: используйте только одно. Если измените часовой пояс или расписание, перезапустите контейнер.
+
+## 4. Проверка `docker-compose.yml`
+
+- Файл поставляется в репозитории и ожидает монтирование каталога `/volume1/tgqueue` в контейнер `/app`.  
+- Команда запуска внутри контейнера устанавливает зависимости из `requirements.txt`, что гарантирует наличие `python-dotenv`, `aiosqlite`, `pytz` и `python-telegram-bot`.
+- Для валидации конфигурации выполните:
+  ```bash
+  docker compose config
+  ```
+  Команда должна завершиться без ошибок.
+
+## 5. Запуск через Docker Compose
+
+1. Убедитесь, что Container Manager активен:
    ```bash
    synoservice --status pkgctl-ContainerManager
    ```
-2. Запустите контейнеры:
+2. Соберите и запустите сервис:
    ```bash
    docker compose pull
    docker compose up -d --build
    ```
-3. Просмотрите логи:
+3. Контроль логов:
    ```bash
    docker compose logs -f
    ```
-   В логах ожидаются строки «Bot started» без ошибок авторизации.
-4. Настройте автозапуск: Container Manager → вкладка «Контейнер» → выберите `postbot_app` → «Действия» → «Включить автозапуск».
+   Ищите строки `Запуск цикла приложения`, `Планировщик инициализирован`, `Старт long-polling`. Ошибки авторизации будут помечены как `CRITICAL`.
+4. Настройте автозапуск: Container Manager → «Контейнер» → выберите `tgqueue` → «Действия» → «Включить автозапуск».
 
-## 5. Запуск в виртуальном окружении Python
+## 6. Альтернативный запуск в виртуальном окружении Python
 
-1. Установите Python 3.11 и модуль `venv` (через `synopkg install` или менеджер пакетов opkg, если требуется).
-2. Создайте окружение и установите зависимости:
+1. Установите Python 3.11 и модуль `venv` (через `synopkg install` или `opkg`).
+2. Настройте окружение:
    ```bash
+   cd /volume1/tgqueue
    python3.11 -m venv venv
    source venv/bin/activate
    pip install --no-cache-dir -r requirements.txt
    ```
 3. Запустите бота:
    ```bash
-   POSTBOT_TELEGRAM_TOKEN=your-telegram-token \
-   POSTBOT_DB_PATH=/volume1/docker/postbot/queue.db \
+   TG_BOT_TOKEN=your-telegram-token \
+   TG_CHANNEL=@your_channel \
+   TZ=Europe/Belgrade \
    python bot.py
    ```
-4. Для автозапуска создайте задачу в Планировщике DSM: «Созданная задача» → «Запланированная задача (пользовательская)» → команда запуска внутри виртуального окружения. Либо используйте `systemd`/`supervisord` в chroot, если предпочитаете классические службы.
+   SQLite-файл `queue.db` создаётся автоматически в текущей директории. Поменять путь можно, запуская скрипт из нужной папки (или наложив `ln -s`).
+4. Для автозапуска создайте задачу в Планировщике DSM с вызовом скрипта внутри `venv`, либо используйте `systemd`/`supervisord` в chroot.
 
-## 6. Проверка работоспособности
+## 7. Проверка работоспособности
 
-1. Убедитесь, что процесс активен:
-   - Docker: `docker compose ps`
-   - venv: `ps -ef | grep bot.py`
-2. Отправьте тестовое сообщение боту в Telegram и убедитесь в ответе.
-3. Проверьте логи на наличие ошибок (`docker compose logs -f` или вывод скрипта).
+1. Контейнер: `docker compose ps` — статус `Up`.  
+   Вариант venv: `ps -ef | grep bot.py`.
+2. Отправьте тестовое сообщение боту. В логе должна появиться запись `Получено новое сообщение от`.
+3. При необходимости включите debug: временно добавьте `POSTBOT_LOG_LEVEL=DEBUG` в `.env`, перезапустите контейнер и снова проверьте `logs -f`.
 
-## 7. Резервное копирование
+## 8. Резервное копирование
 
-- Добавьте в Hyper Backup каталог `/volume1/docker/postbot/.env` и файлы данных (`queue.db` или директория `/data`) для регулярного резервного копирования.
-- Сохраняйте токены в менеджере секретов Synology или стороннем хранилище (Bitwarden, Vault).
+- Добавьте в Hyper Backup файлы `/volume1/tgqueue/.env`, `/volume1/tgqueue/queue.db`, а также логи (по умолчанию `postbot.log`).
+- Храните токены в менеджере секретов (Synology Password Manager, Bitwarden, Vault и т.п.), а в `.env` используйте копию из хранилища.
 
-## 8. Обновление и откат
+## 9. Обновление и откат
 
 ### Обновление
 
 ```bash
-cd /volume1/docker/postbot
+cd /volume1/tgqueue
 git pull
 docker compose build --pull
 docker compose up -d
 ```
 
-Для варианта с venv выполните `pip install -r requirements.txt` и перезапустите скрипт.
+Запуск в `venv`: после `git pull` выполните `pip install -r requirements.txt` и перезапустите `bot.py`.
 
 ### Откат
 
 ```bash
-cd /volume1/docker/postbot
+cd /volume1/tgqueue
 git reset --hard <previous_commit>
 docker compose up -d --build
 ```
 
-При использовании venv после отката повторите установку зависимостей и перезапуск.
+Для `venv` повторно установите зависимости и перезапустите процесс.
 
-## 9. Диагностика
+## 10. Диагностика
 
-- Ошибка авторизации Telegram (`401`/`403`) — перепроверьте `POSTBOT_TELEGRAM_TOKEN`.
-- Flood limit (`429`) — добавьте задержки или уменьшите интенсивность сообщений.
-- Проблемы с файловой системой (permission denied) — проверьте права на том `/volume1` и пользователя, под которым работает контейнер/скрипт.
-
+- `401/403` в логах — некорректный `TG_BOT_TOKEN` или недостаточные права бота в канале.
+- `429` — превышение лимитов Telegram. Уменьшите частоту постинга или расширьте слоты (`POST_SLOTS`).
+- `permission denied` — проверьте владельца каталога `/volume1/tgqueue` и права пользователя, под которым работает Docker.
+- Лог запуска не появляется — убедитесь, что `.env` лежит рядом с `docker-compose.yml` и контейнеру доступна папка `/volume1/tgqueue`.

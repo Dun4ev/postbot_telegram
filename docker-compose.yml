@@ -1,15 +1,14 @@
-# docker-compose.yml (как текстовый файл)
-"""
 services:
   tgqueue:
     image: python:3.11-slim
     container_name: tgqueue
     working_dir: /app
-    command: bash -lc "pip install --no-cache-dir python-telegram-bot==21.8 aiosqlite pytz && python bot.py"
-    environment:
-      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
-      - TG_CHANNEL_ID=${TG_CHANNEL_ID}
-      - TZ=${TZ}
+    env_file:
+      - .env
+    command: >
+      bash -lc
+      "pip install --no-cache-dir -r requirements.txt
+      && python bot.py"
     volumes:
       - /volume1/tgqueue:/app
     restart: unless-stopped
@@ -18,4 +17,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-"""
