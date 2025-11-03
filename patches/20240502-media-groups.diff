@@ -1,0 +1,221 @@
+diff --git a/bot.py b/bot.py
+index a1c3305..f5601b6 100755
+--- a/bot.py
++++ b/bot.py
+@@ -14,6 +14,7 @@ Env:
+ """
+ 
+ import os
++import json
+ import asyncio
+ import logging
+ from dataclasses import dataclass
+@@ -26,7 +27,7 @@ import aiosqlite
+ import pytz
+ 
+ 
+-from telegram import Update
++from telegram import Update, InputMediaPhoto, InputMediaVideo
+ from telegram.constants import ParseMode
+ from telegram.error import RetryAfter, TimedOut, NetworkError
+ from telegram.ext import (
+@@ -45,6 +46,11 @@ load_dotenv(find_dotenv())                   # NEW: подхватить .env и
+ LOGGER_NAME = "postbot"
+ logger = logging.getLogger(LOGGER_NAME)
+ 
++ALBUM_BUFFER_KEY = "album_buffer"
++ALBUM_FLUSH_JOBS_KEY = "album_flush_jobs"
++ALBUM_FLUSH_DELAY = float(os.getenv("POSTBOT_ALBUM_DELAY", "1.5"))
++MAX_ALBUM_ITEMS = int(os.getenv("POSTBOT_ALBUM_MAX", "10"))
++
+ 
+ def _safe_int_env(name: str, default: int) -> int:
+     """
+@@ -181,6 +187,83 @@ async def enqueue(kind: str, payload: str, caption: str = "") -> None:
+         )
+         await db.commit()
+ 
++
++def _album_buffer(context: ContextTypes.DEFAULT_TYPE) -> dict:
++    return context.application.bot_data.setdefault(ALBUM_BUFFER_KEY, {})
++
++
++def _album_jobs(context: ContextTypes.DEFAULT_TYPE) -> dict:
++    return context.application.bot_data.setdefault(ALBUM_FLUSH_JOBS_KEY, {})
++
++
++def _schedule_album_flush(context: ContextTypes.DEFAULT_TYPE, media_group_id: str) -> None:
++    jobs = _album_jobs(context)
++    if existing := jobs.pop(media_group_id, None):
++        existing.schedule_removal()
++    job = context.job_queue.run_once(
++        _flush_album_buffer,
++        when=ALBUM_FLUSH_DELAY,
++        data={"media_group_id": media_group_id},
++        name=f"flush_album_{media_group_id}",
++    )
++    jobs[media_group_id] = job
++
++
++async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
++    media_group_id = context.job.data.get("media_group_id")
++    buffer = _album_buffer(context)
++    entry = buffer.pop(media_group_id, None)
++    _album_jobs(context).pop(media_group_id, None)
++    if not entry or not entry.get("items"):
++        logger.debug("Буфер альбома %s пуст — пропуск", media_group_id)
++        return
++    caption = entry.get("caption") or ""
++    await enqueue("album", json.dumps(entry["items"]), caption)
++    logger.info(
++        "Альбом media_group_id=%s отправлен в очередь (%d элементов)",
++        media_group_id,
++        len(entry["items"]),
++    )
++
++
++def _handle_media_group(
++    update: Update,
++    context: ContextTypes.DEFAULT_TYPE,
++    kind: str,
++    file_id: str,
++    caption: str,
++) -> bool:
++    message = update.message
++    if not message:
++        return False
++    media_group_id = message.media_group_id
++    if not media_group_id:
++        return False
++
++    buffer = _album_buffer(context)
++    entry = buffer.setdefault(media_group_id, {"items": [], "caption": caption or ""})
++    if caption and not entry.get("caption"):
++        entry["caption"] = caption
++
++    if len(entry["items"]) >= MAX_ALBUM_ITEMS:
++        logger.warning(
++            "Альбом media_group_id=%s достиг лимита %d — элемент отброшен",
++            media_group_id,
++            MAX_ALBUM_ITEMS,
++        )
++    else:
++        entry["items"].append({"type": kind, "file_id": file_id})
++        logger.debug(
++            "Альбом media_group_id=%s пополнен (%d/%d)",
++            media_group_id,
++            len(entry["items"]),
++            MAX_ALBUM_ITEMS,
++        )
++
++    _schedule_album_flush(context, media_group_id)
++    return True
++
++
+ async def dequeue() -> Optional[QueueItem]:
+     async with aiosqlite.connect(DB_PATH) as db:
+         cur = await db.execute(
+@@ -241,18 +324,34 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+         "text": "📝",
+         "photo": "🖼️",
+         "video": "🎞️",
++        "album": "📚",
+     }
+     for it in items:
+         icon = icon_by_kind.get(it.kind, "❔")
+-        has_caption = it.kind in {"photo", "video"} and it.caption
+-        preview_src = it.caption if has_caption else it.payload
+-        preview = (preview_src or "").replace("\n", " ")[:70]
++        if it.kind == "album":
++            try:
++                album_items = json.loads(it.payload)
++            except json.JSONDecodeError:
++                album_items = []
++            caption = (it.caption or "").replace("\n", " ")[:50]
++            preview = f"{len(album_items)} media"
++            if caption:
++                preview = f"{preview} — {caption}"
++        else:
++            has_caption = it.kind in {"photo", "video"} and it.caption
++            preview_src = it.caption if has_caption else it.payload
++            preview = (preview_src or "").replace("\n", " ")[:70]
+         lines.append(f"{icon} #{it.id}  {preview}")
+     await update.message.reply_text("Ближайшие посты:\n" + "\n".join(lines))
+ 
+ async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+     logger.warning("Команда /purge от %s", _actor(update))
+     await purge()
++    _album_buffer(context).clear()
++    jobs = _album_jobs(context)
++    for job in jobs.values():
++        job.schedule_removal()
++    jobs.clear()
+     await update.message.reply_text("Очередь очищена 🧹")
+ 
+ async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@@ -273,6 +372,9 @@ async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+         _actor(update),
+         len(caption),
+     )
++    if _handle_media_group(update, context, "photo", file_id, caption):
++        await update.message.reply_text("Альбом обновлён, жду остальные кадры 📚")
++        return
+     await enqueue("photo", file_id, caption)
+     await update.message.reply_text("Фото добавлено в очередь 🖼️")
+ 
+@@ -289,6 +391,9 @@ async def h_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+         getattr(video, "file_size", "unknown"),
+         len(caption),
+     )
++    if _handle_media_group(update, context, "video", file_id, caption):
++        await update.message.reply_text("Альбом обновлён, жду остальные кадры 📚")
++        return
+     await enqueue("video", file_id, caption)
+     await update.message.reply_text("Видео добавлено в очередь 🎞️")
+ 
+@@ -325,6 +430,45 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
+                 parse_mode=ParseMode.HTML,
+                 supports_streaming=True,
+             )
++        elif item.kind == "album":
++            try:
++                album_items = json.loads(item.payload or "[]")
++            except json.JSONDecodeError:
++                album_items = []
++                logger.error("Повреждённые данные альбома #%s — пропуск", item.id)
++            if not album_items:
++                logger.warning("Альбом #%s пуст — удалён без публикации", item.id)
++                return
++            media_objects: List = []
++            for index, media in enumerate(album_items):
++                media_type = media.get("type")
++                file_id = media.get("file_id")
++                if not file_id:
++                    logger.warning(
++                        "Элемент альбома #%s без file_id (position=%d) — пропуск",
++                        item.id,
++                        index,
++                    )
++                    continue
++                if media_type == "photo":
++                    obj = InputMediaPhoto(file_id)
++                elif media_type == "video":
++                    obj = InputMediaVideo(file_id, supports_streaming=True)
++                else:
++                    logger.warning(
++                        "Элемент альбома #%s с неизвестным типом '%s' — пропуск",
++                        item.id,
++                        media_type,
++                    )
++                    continue
++                if index == 0 and item.caption:
++                    obj.caption = item.caption
++                    obj.parse_mode = ParseMode.HTML
++                media_objects.append(obj)
++            if not media_objects:
++                logger.warning("Все элементы альбома #%s отфильтрованы — пропуск", item.id)
++                return
++            await context.bot.send_media_group(chat_id=TARGET_CHAT, media=media_objects)
+     except RetryAfter as e:
+         # Telegram просит подождать e.retry_after секунд (Flood control)
+         delay = int(getattr(e, "retry_after", 5)) + 1
