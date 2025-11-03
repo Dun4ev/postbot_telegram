@@ -18,7 +18,7 @@ import json
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import time as dtime
+from datetime import time as dtime, datetime
 from typing import Optional, List
 
 from logging.handlers import RotatingFileHandler
@@ -147,6 +147,23 @@ logger.info(
 
 DB_PATH = "queue.db"
 logger.info("Файл очереди: %s", DB_PATH)
+
+
+def _compute_next_slot(now: datetime) -> Optional[dtime]:
+    if not DAILY_SLOTS:
+        return None
+    ordered = sorted(DAILY_SLOTS, key=lambda t: (t.hour, t.minute))
+    for slot in ordered:
+        slot_today = now.replace(
+            hour=slot.hour,
+            minute=slot.minute,
+            second=0,
+            microsecond=0,
+        )
+        if slot_today >= now:
+            return slot
+    return ordered[0]
+
 
 # ---------------------- Data model / storage ----------------------
 
@@ -286,6 +303,12 @@ async def peek_many(n: int = 10) -> List[QueueItem]:
         rows = await cur.fetchall()
         return [QueueItem(*r) for r in rows]
 
+async def queue_size() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM queue")
+        row = await cur.fetchone()
+        return int(row[0] if row and row[0] is not None else 0)
+
 async def purge() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM queue")
@@ -343,6 +366,16 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
             preview = (preview_src or "").replace("\n", " ")[:70]
         lines.append(f"{icon} #{it.id}  {preview}")
     await update.message.reply_text("Ближайшие посты:\n" + "\n".join(lines))
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Команда /health от %s", _actor(update))
+    size = await queue_size()
+    now_local = datetime.now(TZ)
+    slot = _compute_next_slot(now_local)
+    slot_txt = slot.strftime("%H:%M") if slot else "—"
+    await update.message.reply_text(
+        f"Бот жив, {size} сообщений в очереди, ближайший слот {slot_txt}"
+    )
 
 async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.warning("Команда /purge от %s", _actor(update))
@@ -504,6 +537,7 @@ def build_app() -> Application:
     # команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("purge", cmd_purge))
 
     # контент
