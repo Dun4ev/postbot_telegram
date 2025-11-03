@@ -1,6 +1,6 @@
 # Развёртывание Postbot на Synology DSM
 
-Инструкция описывает подготовку окружения и запуск очереди постинга `postbot` на NAS Synology с DSM 7.x. Репозиторий предполагается размещать в каталоге `/volume1/tgqueue`. При необходимости замените путь во всех командах на свой.
+Инструкция описывает подготовку окружения и запуск очереди постинга `postbot` на NAS Synology с DSM 7.x. Репозиторий предполагается размещать в каталоге `/volume1/docker/postbot`. При необходимости замените путь во всех командах на свой.
 
 ## 1. Предварительные требования
 
@@ -19,11 +19,11 @@
    ```
 2. Создайте рабочую папку (если ещё не существует):
    ```bash
-   mkdir -p /volume1/tgqueue
+   mkdir -p /volume1/docker/postbot
    ```
 3. Клонируйте проект в каталог:
    ```bash
-   cd /volume1/tgqueue
+   cd /volume1/docker/postbot
    git clone https://github.com/Dun4ev/postbot_telegram.git .
    ```
 
@@ -49,7 +49,7 @@ EOF
 
 ## 4. Проверка `docker-compose.yml`
 
-- Файл поставляется в репозитории и ожидает монтирование каталога `/volume1/tgqueue` в контейнер `/app`.  
+- Файл поставляется в репозитории и ожидает монтирование каталога `/volume1/docker/postbot` в контейнер `/app`.  
 - Команда запуска внутри контейнера устанавливает зависимости из `requirements.txt`, что гарантирует наличие `python-dotenv`, `aiosqlite`, `pytz` и `python-telegram-bot`.
 - Для валидации конфигурации выполните:
   ```bash
@@ -57,7 +57,21 @@ EOF
   ```
   Команда должна завершиться без ошибок.
 
-## 5. Запуск через Docker Compose
+## 5. Запуск через Container Manager
+
+### Вариант A: через GUI (Container Manager)
+
+1. Откройте DSM → **Container Manager** (или **Docker** в старых версиях).
+2. Выберите **Container** → **Создать** → **Создать из Compose файла**.
+3. В поле "Путь к project" укажите `/volume1/docker/postbot`.
+4. Нажмите **Далее**. Проверьте конфигурацию и нажмите **Готово**.
+5. Дождитесь сборки образа и запуска контейнера.
+6. Откройте контейнер `postbot` → **Подробности** → **Лог**.
+   - Ищите строки `Запуск цикла приложения`, `Планировщик инициализирован`, `Старт long-polling`.
+   - Ошибки авторизации будут помечены как `CRITICAL`.
+7. Для автозапуска: **Подробности** → **Действие** → **Редактировать** → включите **Автоматически перезапускать контейнер**.
+
+### Вариант B: через SSH (командная строка)
 
 1. Убедитесь, что Container Manager активен:
    ```bash
@@ -65,7 +79,7 @@ EOF
    ```
 2. Соберите и запустите сервис:
    ```bash
-   docker compose pull
+   cd /volume1/docker/postbot
    docker compose up -d --build
    ```
 3. Контроль логов:
@@ -73,14 +87,14 @@ EOF
    docker compose logs -f
    ```
    Ищите строки `Запуск цикла приложения`, `Планировщик инициализирован`, `Старт long-polling`. Ошибки авторизации будут помечены как `CRITICAL`.
-4. Настройте автозапуск: Container Manager → «Контейнер» → выберите `tgqueue` → «Действия» → «Включить автозапуск».
+4. Настройте автозапуск: Container Manager → **Контейнер** → выберите `postbot` → **Действия** → **Включить автозапуск**.
 
 ## 6. Альтернативный запуск в виртуальном окружении Python
 
-1. Установите Python 3.11 и модуль `venv` (через `synopkg install` или `opkg`).
+1. Установите Python 3.11 и модуль `venv` (через `synopkg install` или `opkg`).
 2. Настройте окружение:
    ```bash
-   cd /volume1/tgqueue
+   cd /volume1/docker/postbot
    python3.11 -m venv venv
    source venv/bin/activate
    pip install --no-cache-dir -r requirements.txt
@@ -104,7 +118,7 @@ EOF
 
 ## 8. Резервное копирование
 
-- Добавьте в Hyper Backup файлы `/volume1/tgqueue/.env`, `/volume1/tgqueue/queue.db`, а также логи (по умолчанию `postbot.log`).
+- Добавьте в Hyper Backup файлы `/volume1/docker/postbot/.env`, `/volume1/docker/postbot/queue.db`, а также логи (по умолчанию `postbot.log`).
 - Храните токены в менеджере секретов (Synology Password Manager, Bitwarden, Vault и т.п.), а в `.env` используйте копию из хранилища.
 
 ## 9. Обновление и откат
@@ -112,7 +126,7 @@ EOF
 ### Обновление
 
 ```bash
-cd /volume1/tgqueue
+cd /volume1/docker/postbot
 git pull
 docker compose build --pull
 docker compose up -d
@@ -123,7 +137,7 @@ docker compose up -d
 ### Откат
 
 ```bash
-cd /volume1/tgqueue
+cd /volume1/docker/postbot
 git reset --hard <previous_commit>
 docker compose up -d --build
 ```
@@ -134,5 +148,5 @@ docker compose up -d --build
 
 - `401/403` в логах — некорректный `TG_BOT_TOKEN` или недостаточные права бота в канале.
 - `429` — превышение лимитов Telegram. Уменьшите частоту постинга или расширьте слоты (`POST_SLOTS`).
-- `permission denied` — проверьте владельца каталога `/volume1/tgqueue` и права пользователя, под которым работает Docker.
-- Лог запуска не появляется — убедитесь, что `.env` лежит рядом с `docker-compose.yml` и контейнеру доступна папка `/volume1/tgqueue`.
+- `permission denied` — проверьте владельца каталога `/volume1/docker/postbot` и права пользователя, под которым работает Docker.
+- Лог запуска не появляется — убедитесь, что `.env` лежит рядом с `docker-compose.yml` и контейнеру доступна папка `/volume1/docker/postbot`.

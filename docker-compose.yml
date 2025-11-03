@@ -1,7 +1,7 @@
 services:
-  tgqueue:
+  postbot:
     image: python:3.11-slim
-    container_name: tgqueue
+    container_name: postbot
     working_dir: /app
     env_file:
       - .env
@@ -10,7 +10,7 @@ services:
       "pip install --no-cache-dir -r requirements.txt
       && python bot.py"
     volumes:
-      - /volume1/tgqueue:/app
+      - /volume1/docker/postbot:/app
     restart: unless-stopped
     logging:
       driver: json-file
