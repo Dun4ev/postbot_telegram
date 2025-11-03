@@ -225,7 +225,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slots_txt = ", ".join([s.strftime("%H:%M") for s in DAILY_SLOTS])
     logger.info("Команда /start от %s", _actor(update))
     await update.message.reply_text(
-        "Привет! Кидай мне текст или фото с подписью — я поставлю в очередь.\n"
+        "Привет! Кидай мне текст, фото или видео с подписью — я поставлю в очередь.\n"
         f"Публикую в канале по слотам: {slots_txt} ({TZ_NAME}).\n"
         "Команды: /queue — показать очередь; /purge — очистить."
     )
@@ -237,9 +237,15 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Очередь пуста ✅")
         return
     lines = []
+    icon_by_kind = {
+        "text": "📝",
+        "photo": "🖼️",
+        "video": "🎞️",
+    }
     for it in items:
-        icon = "📝" if it.kind == "text" else "🖼️"
-        preview_src = it.caption if it.kind == "photo" and it.caption else it.payload
+        icon = icon_by_kind.get(it.kind, "❔")
+        has_caption = it.kind in {"photo", "video"} and it.caption
+        preview_src = it.caption if has_caption else it.payload
         preview = (preview_src or "").replace("\n", " ")[:70]
         lines.append(f"{icon} #{it.id}  {preview}")
     await update.message.reply_text("Ближайшие посты:\n" + "\n".join(lines))
@@ -270,6 +276,22 @@ async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await enqueue("photo", file_id, caption)
     await update.message.reply_text("Фото добавлено в очередь 🖼️")
 
+async def h_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    video = update.message.video
+    if not video:
+        return
+    file_id = video.file_id
+    caption = update.message.caption or ""
+    logger.info(
+        "Получено видео от %s (duration=%s, file_size=%s, caption_len=%d)",
+        _actor(update),
+        getattr(video, "duration", "unknown"),
+        getattr(video, "file_size", "unknown"),
+        len(caption),
+    )
+    await enqueue("video", file_id, caption)
+    await update.message.reply_text("Видео добавлено в очередь 🎞️")
+
 # ---------------------- Publishing job ----------------------
 
 async def publish_next(context: ContextTypes.DEFAULT_TYPE):
@@ -294,6 +316,14 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
                 photo=item.payload,  # file_id
                 caption=item.caption or None,
                 parse_mode=ParseMode.HTML
+            )
+        elif item.kind == "video":
+            await context.bot.send_video(
+                chat_id=TARGET_CHAT,
+                video=item.payload,
+                caption=item.caption or None,
+                parse_mode=ParseMode.HTML,
+                supports_streaming=True,
             )
     except RetryAfter as e:
         # Telegram просит подождать e.retry_after секунд (Flood control)
@@ -334,6 +364,7 @@ def build_app() -> Application:
 
     # контент
     app.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), h_photo))
+    app.add_handler(MessageHandler(filters.VIDEO & (~filters.COMMAND), h_video))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), h_text))
 
     # ежедневные слоты
