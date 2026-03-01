@@ -171,3 +171,22 @@ docker compose up -d --build
 - `429` — превышение лимитов Telegram. Уменьшите частоту постинга или расширьте слоты (`POST_SLOTS`).
 - `permission denied` — проверьте владельца каталога `/volume1/docker/postbot` и права пользователя, под которым работает Docker.
 - Лог запуска не появляется — убедитесь, что `.env` лежит рядом с `docker-compose.yml` и контейнеру доступна папка `/volume1/docker/postbot`.
+
+## 11. Права доступа (Permissions)
+
+Если бот не может сохранить фото или обновить базу данных (`sqlite3.OperationalError` или `Permission denied`):
+
+1.  **Проверьте владельца папки**:
+    ```bash
+    ls -ld /volume1/docker/postbot/storage
+    ```
+2.  **Дайте полные права на запись** (самый простой способ для Synology):
+    ```bash
+    sudo chmod -R 777 /volume1/docker/postbot/storage
+    sudo chmod 666 /volume1/docker/postbot/repo/queue.db
+    ```
+3.  **Тест записи внутри контейнера**:
+    ```bash
+    docker exec -it postbot touch /app/storage/write_test.txt
+    ```
+    Если файл появился на Synology в папке `storage`, значит права настроены верно.
