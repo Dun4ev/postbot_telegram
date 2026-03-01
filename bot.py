@@ -40,6 +40,8 @@ from telegram.ext import (
 
 from dotenv import load_dotenv, find_dotenv  # NEW
 load_dotenv(find_dotenv())                   # NEW: подхватить .env из текущей папки
+
+import x_publisher  # NEW: интеграция с X
 # если .env лежит не рядом со скриптом:
 # load_dotenv("/полный/путь/к/.env")
 
@@ -387,6 +389,19 @@ async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     jobs.clear()
     await update.message.reply_text("Очередь очищена 🧹")
 
+async def cmd_publish_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Принудительно публикует следующий элемент из очереди прямо сейчас.
+    """
+    logger.info("Команда /publish_now от %s", _actor(update))
+    size = await queue_size()
+    if size == 0:
+        await update.message.reply_text("Очередь пуста, нечего публиковать 🤷‍♂️")
+        return
+    
+    await update.message.reply_text("Запускаю внеочередную публикацию... 🚀")
+    await publish_next(context)
+
 async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
@@ -502,6 +517,18 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("Все элементы альбома #%s отфильтрованы — пропуск", item.id)
                 return
             await context.bot.send_media_group(chat_id=TARGET_CHAT, media=media_objects)
+        
+        # --- NEW: Публикация в X ---
+        if x_publisher.X_ENABLED:
+            logger.info("Запуск параллельной публикации в X для элемента #%s", item.id)
+            # Мы не блокируем основной поток TG, но ждем выполнения для логов
+            asyncio.create_task(x_publisher.publish_to_x(
+                context.bot, 
+                item.kind, 
+                item.payload, 
+                item.caption
+            ))
+        # ---------------------------
     except RetryAfter as e:
         # Telegram просит подождать e.retry_after секунд (Flood control)
         delay = int(getattr(e, "retry_after", 5)) + 1
@@ -529,8 +556,23 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------------- Application / Polling ----------------------
 
+async def post_init(application: Application) -> None:
+    """
+    Устанавливает меню команд в Telegram при запуске.
+    """
+    from telegram import BotCommand
+    commands = [
+        BotCommand("start", "Запустить бота и справка"),
+        BotCommand("queue", "Посмотреть очередь"),
+        BotCommand("now", "Опубликовать следующий пост сейчас"),
+        BotCommand("health", "Статус бота и слотов"),
+        BotCommand("purge", "Очистить очередь (ОПАСНО)"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Меню команд успешно установлено")
+
 def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(2).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(2).post_init(post_init).build()
     app.job_queue.scheduler.configure(timezone=TZ)
 
     logger.info("Регистрация обработчиков команд и сообщений")
@@ -539,6 +581,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("purge", cmd_purge))
+    app.add_handler(CommandHandler("now", cmd_publish_now))
+    app.add_handler(CommandHandler("publish_now", cmd_publish_now))
 
     # контент
     app.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), h_photo))
