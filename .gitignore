@@ -42,6 +42,17 @@ docker-compose.override.yml
 .DS_Store
 Thumbs.db
 
+# Project Specific
+patches/
+.gemini/
+.agents/
+.agent/
+_agents/
+_agent/
+queue.db-journal
+queue.db-wal
+storage/
+
 # Env files
 .env
 .env.*
@@ -49,4 +60,3 @@ Thumbs.db
 # Local config
 local_settings.py
 ChatExport_2026-01-29/
-storage/
