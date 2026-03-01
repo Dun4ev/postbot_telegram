@@ -11,7 +11,7 @@ services:
       && python bot.py"
     volumes:
       - /volume1/docker/postbot:/app
-      - /volume1/tgqueue/storage:/app/storage
+      - /volume1/docker/storage:/app/storage
     restart: unless-stopped
     logging:
       driver: json-file
