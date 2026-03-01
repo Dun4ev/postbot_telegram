@@ -141,6 +141,14 @@ def _parse_slots_from_env() -> List[dtime]:
         slots.append(dtime(int(hh), int(mm), tzinfo=TZ))
     return slots
 
+POSTBOT_SIGNATURE = os.getenv("POSTBOT_SIGNATURE", "")
+
+def _apply_signature(caption: str) -> str:
+    """Добавляет глобальную подпись к тексту."""
+    if not POSTBOT_SIGNATURE:
+        return caption
+    return f"{caption}{POSTBOT_SIGNATURE}".strip()
+
 DAILY_SLOTS = _parse_slots_from_env()
 logger.info(
     "Активные временные слоты: %s",
@@ -148,7 +156,37 @@ logger.info(
 )
 
 DB_PATH = "queue.db"
-logger.info("Файл очереди: %s", DB_PATH)
+STORAGE_DIR = os.getenv("POSTBOT_STORAGE_DIR", "storage")
+logger.info("Файл очереди: %s, Директория хранения: %s", DB_PATH, STORAGE_DIR)
+
+
+# ---------------------- Data model / storage ----------------------
+
+@dataclass
+class QueueItem:
+    id: int
+    kind: str        # 'text' | 'photo' | 'video' | 'album'
+    payload: str     # text or LOCAL PATH (or JSON for album)
+    caption: str     # optional
+
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS queue (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind     TEXT    NOT NULL,
+  payload  TEXT    NOT NULL,
+  caption  TEXT    NOT NULL DEFAULT '',
+  created  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE TABLE IF NOT EXISTS assets (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  path         TEXT    NOT NULL,
+  kind         TEXT    NOT NULL,
+  caption      TEXT    NOT NULL DEFAULT '',
+  source       TEXT    NOT NULL DEFAULT 'direct',
+  created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+"""
 
 
 def _compute_next_slot(now: datetime) -> Optional[dtime]:
@@ -191,6 +229,30 @@ async def db_init() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(CREATE_SQL)
         await db.commit()
+
+async def save_media_locally(bot, file_id: str, kind: str) -> str:
+    """
+    Скачивает файл из Telegram и сохраняет его в папку storage. 
+    Возвращает относительный путь к файлу.
+    """
+    now = datetime.now()
+    # Структура: storage/год/месяц/день_время_тип_id.ext
+    rel_dir = os.path.join(STORAGE_DIR, str(now.year), f"{now.month:02d}")
+    abs_dir = os.path.join(os.getcwd(), rel_dir)
+    os.makedirs(abs_dir, exist_ok=True)
+    
+    file = await bot.get_file(file_id)
+    ext = "jpg" if kind == "photo" else "mp4"
+    if hasattr(file, 'file_path') and file.file_path:
+        ext = file.file_path.split('.')[-1]
+        
+    filename = f"{now.strftime('%d_%H%M%S')}_{kind}_{file_id[:8]}.{ext}"
+    rel_path = os.path.join(rel_dir, filename)
+    abs_path = os.path.join(abs_dir, filename)
+    
+    await file.download_to_drive(abs_path)
+    logger.info("Файл сохранен локально: %s", rel_path)
+    return rel_path
 
 async def enqueue(kind: str, payload: str, caption: str = "") -> None:
     logger.info(
@@ -237,7 +299,13 @@ async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.debug("Буфер альбома %s пуст — пропуск", media_group_id)
         return
     caption = entry.get("caption") or ""
-    await enqueue("album", json.dumps(entry["items"]), caption)
+    # Для альбомов мы сохраняем JSON со списком локальных путей
+    items_with_local_paths = []
+    for it in entry["items"]:
+        local_path = await save_media_locally(context.bot, it["file_id"], it["type"])
+        items_with_local_paths.append({"type": it["type"], "path": local_path})
+        
+    await enqueue("album", json.dumps(items_with_local_paths), caption)
     logger.info(
         "Альбом media_group_id=%s отправлен в очередь (%d элементов)",
         media_group_id,
@@ -402,6 +470,38 @@ async def cmd_publish_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Запускаю внеочередную публикацию... 🚀")
     await publish_next(context)
 
+async def cmd_restock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Берет N случайных элементов из assets и добавляет их в очередь.
+    Использование: /restock [количество]
+    """
+    logger.info("Команда /restock от %s", _actor(update))
+    args = context.args
+    count = 5
+    if args and args[0].isdigit():
+        count = int(args[0])
+    
+    # Ограничим разумным пределом
+    count = min(max(count, 1), 50)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Берем случайные элементы, которые еще не в текущей очереди
+        # (упрощенно: просто случайные из assets)
+        async with db.execute(
+            "SELECT path, kind, caption FROM assets ORDER BY RANDOM() LIMIT ?", 
+            (count,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            
+        for path, kind, caption in rows:
+            await db.execute(
+                "INSERT INTO queue (kind, payload, caption) VALUES (?, ?, ?)",
+                (kind, path, caption)
+            )
+        await db.commit()
+    
+    await update.message.reply_text(f"✅ Очередь пополнена: добавлено {len(rows)} случайных постов из архива.")
+
 async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
@@ -423,8 +523,10 @@ async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _handle_media_group(update, context, "photo", file_id, caption):
         await update.message.reply_text("Альбом обновлён, жду остальные кадры 📚")
         return
-    await enqueue("photo", file_id, caption)
-    await update.message.reply_text("Фото добавлено в очередь 🖼️")
+    
+    local_path = await save_media_locally(context.bot, file_id, "photo")
+    await enqueue("photo", local_path, caption)
+    await update.message.reply_text("Фото добавлено в локальный архив и очередь 🖼️")
 
 async def h_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video = update.message.video
@@ -442,8 +544,10 @@ async def h_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _handle_media_group(update, context, "video", file_id, caption):
         await update.message.reply_text("Альбом обновлён, жду остальные кадры 📚")
         return
-    await enqueue("video", file_id, caption)
-    await update.message.reply_text("Видео добавлено в очередь 🎞️")
+    
+    local_path = await save_media_locally(context.bot, file_id, "video")
+    await enqueue("video", local_path, caption)
+    await update.message.reply_text("Видео добавлено в локальный архив и очередь 🎞️")
 
 # ---------------------- Publishing job ----------------------
 
@@ -464,20 +568,22 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=TARGET_CHAT, text=item.payload, parse_mode=ParseMode.HTML
             )
         elif item.kind == "photo":
-            await context.bot.send_photo(
-                chat_id=TARGET_CHAT,
-                photo=item.payload,  # file_id
-                caption=item.caption or None,
-                parse_mode=ParseMode.HTML
-            )
+            with open(item.payload, 'rb') as f:
+                await context.bot.send_photo(
+                    chat_id=TARGET_CHAT,
+                    photo=f,
+                    caption=item.caption or None,
+                    parse_mode=ParseMode.HTML
+                )
         elif item.kind == "video":
-            await context.bot.send_video(
-                chat_id=TARGET_CHAT,
-                video=item.payload,
-                caption=item.caption or None,
-                parse_mode=ParseMode.HTML,
-                supports_streaming=True,
-            )
+            with open(item.payload, 'rb') as f:
+                await context.bot.send_video(
+                    chat_id=TARGET_CHAT,
+                    video=f,
+                    caption=item.caption or None,
+                    parse_mode=ParseMode.HTML,
+                    supports_streaming=True,
+                )
         elif item.kind == "album":
             try:
                 album_items = json.loads(item.payload or "[]")
@@ -490,19 +596,22 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
             media_objects: List = []
             for index, media in enumerate(album_items):
                 media_type = media.get("type")
-                file_id = media.get("file_id")
-                if not file_id:
+                file_path = media.get("path")
+                if not file_path or not os.path.exists(file_path):
                     logger.warning(
-                        "Элемент альбома #%s без file_id (position=%d) — пропуск",
+                        "Элемент альбома #%s без файла (position=%d) — пропуск",
                         item.id,
                         index,
                     )
                     continue
+                
+                f = open(file_path, 'rb')
                 if media_type == "photo":
-                    obj = InputMediaPhoto(file_id)
+                    obj = InputMediaPhoto(f)
                 elif media_type == "video":
-                    obj = InputMediaVideo(file_id, supports_streaming=True)
+                    obj = InputMediaVideo(f, supports_streaming=True)
                 else:
+                    f.close()
                     logger.warning(
                         "Элемент альбома #%s с неизвестным типом '%s' — пропуск",
                         item.id,
@@ -526,7 +635,7 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
                 context.bot, 
                 item.kind, 
                 item.payload, 
-                item.caption
+                _apply_signature(item.caption)
             ))
         # ---------------------------
     except RetryAfter as e:
@@ -565,6 +674,7 @@ async def post_init(application: Application) -> None:
         BotCommand("start", "Запустить бота и справка"),
         BotCommand("queue", "Посмотреть очередь"),
         BotCommand("now", "Опубликовать следующий пост сейчас"),
+        BotCommand("restock", "Пополнить очередь из архива"),
         BotCommand("health", "Статус бота и слотов"),
         BotCommand("purge", "Очистить очередь (ОПАСНО)"),
     ]
@@ -583,6 +693,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("purge", cmd_purge))
     app.add_handler(CommandHandler("now", cmd_publish_now))
     app.add_handler(CommandHandler("publish_now", cmd_publish_now))
+    app.add_handler(CommandHandler("restock", cmd_restock))
 
     # контент
     app.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), h_photo))

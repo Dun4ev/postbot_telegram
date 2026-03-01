@@ -9,7 +9,8 @@
 - Установленный **Container Manager** (ранее Docker) либо Python 3.11 с модулем `venv` — в зависимости от выбранного способа запуска.
 - Свежий токен Telegram-бота (`TG_BOT_TOKEN`), полученный через @BotFather.
 - Идентификатор канала (`TG_CHANNEL` вида `@your_channel` или `TG_CHANNEL_ID` вида `-100…`).
-- Свободное место на томе для файла очереди `queue.db` и логов.
+- Свободное место на томе для файла очереди `queue.db`, логов и **локального архива медиа** в папке `storage`.
+- (Опционально) API-ключи X.com (Twitter) для кросс-постинга.
 
 ## 2. Подготовка каталога
 
@@ -39,9 +40,18 @@ TG_BOT_TOKEN=your-telegram-token
 # укажите одно из значений ниже
 TG_CHANNEL=@your_channel
 # TG_CHANNEL_ID=-1001234567890
+# --- X (Twitter) Config ---
+X_ENABLED=0
+X_API_KEY=...
+X_API_SECRET=...
+X_ACCESS_TOKEN=...
+X_ACCESS_TOKEN_SECRET=...
+X_BEARER_TOKEN=...
+
+# --- Behavoir ---
 TZ=Europe/Belgrade
-# доп. параметры при необходимости
-# POST_SLOTS=10:00,13:00,16:00,19:00,22:00
+POST_SLOTS=10:00,13:00,16:00,19:00,22:00
+POSTBOT_STORAGE_DIR=storage
 EOF
 ```
 
@@ -57,8 +67,14 @@ EOF
 
 ## 4. Проверка `docker-compose.yml`
 
-- Файл поставляется в репозитории и ожидает монтирование каталога `/volume1/docker/postbot` в контейнер `/app`.  
-- Команда запуска внутри контейнера устанавливает зависимости из `requirements.txt`, что гарантирует наличие `python-dotenv`, `aiosqlite`, `pytz` и `python-telegram-bot`.
+- Файл поставляется в репозитории и ожидает монтирование каталога проекта в `/app`.
+- **Важно:** Для хранения медиа рекомендуется монтировать папку `storage` на отдельный путь (например, `/volume1/tgqueue/storage`), чтобы файлы не терялись при пересборке проекта. Пример в `docker-compose.yml`:
+  ```yaml
+  volumes:
+    - /volume1/docker/postbot:/app
+    - /volume1/tgqueue/storage:/app/storage
+  ```
+- Команда запуска внутри контейнера устанавливает зависимости из `requirements.txt`, включая `tweepy` для X.com.
 - Для валидации конфигурации выполните:
   ```bash
   docker compose config
@@ -126,7 +142,8 @@ EOF
 
 ## 8. Резервное копирование
 
-- Добавьте в Hyper Backup файлы `/volume1/docker/postbot/.env`, `/volume1/docker/postbot/queue.db`, а также логи (по умолчанию `postbot.log`).
+- Добавьте в Hyper Backup файлы `.env`, `queue.db`, а также **всю папку `storage`**.
+- Именно в `storage` находится ваш постоянный архив медиафайлов.
 - Храните токены в менеджере секретов (Synology Password Manager, Bitwarden, Vault и т.п.), а в `.env` используйте копию из хранилища.
 
 ## 9. Обновление и откат

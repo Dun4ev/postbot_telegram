@@ -72,8 +72,7 @@ async def publish_to_x(bot, kind: str, payload: str, caption: str = "") -> bool:
             text_to_post = payload
         elif kind in ("photo", "video"):
             text_to_post = caption
-            # Для скачивания из Telegram нужен доступ к bot
-            media_id = await _upload_media_by_file_id(bot, api_v1, payload, kind)
+            media_id = _upload_media_by_path(api_v1, payload, kind)
             if media_id:
                 media_ids.append(media_id)
         elif kind == "album":
@@ -81,7 +80,7 @@ async def publish_to_x(bot, kind: str, payload: str, caption: str = "") -> bool:
             try:
                 items = json.loads(payload)
                 for item in items[:4]:  # X разрешает до 4 фото
-                    m_id = await _upload_media_by_file_id(bot, api_v1, item['file_id'], item['type'])
+                    m_id = _upload_media_by_path(api_v1, item['path'], item['type'])
                     if m_id:
                         media_ids.append(m_id)
             except Exception:
@@ -103,25 +102,19 @@ async def publish_to_x(bot, kind: str, payload: str, caption: str = "") -> bool:
         logger.exception("Ошибка при публикации в X: %s", e)
         return False
 
-async def _upload_media_by_file_id(bot, api_v1, file_id: str, kind: str) -> Optional[str]:
+def _upload_media_by_path(api_v1, file_path: str, kind: str) -> Optional[str]:
     """
-    Скачивает файл из Telegram и загружает в X.
+    Загружает файл с диска в X.
     """
-    tmp_path = f"/tmp/x_upload_{file_id}"
-    try:
-        # Получаем файл из TG
-        tg_file = await bot.get_file(file_id)
-        await tg_file.download_to_drive(tmp_path)
-
-        # Загружаем в X (API v1.1)
-        # Для видео нужен chunked=True
-        is_video = kind == "video"
-        media = api_v1.media_upload(filename=tmp_path, media_category='tweet_video' if is_video else 'tweet_image')
+    if not os.path.exists(file_path):
+        logger.error("Файл не найден для загрузки в X: %s", file_path)
+        return None
         
+    try:
+        # Загружаем в X (API v1.1)
+        is_video = kind == "video"
+        media = api_v1.media_upload(filename=file_path, media_category='tweet_video' if is_video else 'tweet_image')
         return media.media_id_string
     except Exception as e:
-        logger.error("Ошибка загрузки медиа в X (%s): %s", file_id, e)
+        logger.error("Ошибка загрузки медиа в X (%s): %s", file_path, e)
         return None
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
