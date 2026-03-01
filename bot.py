@@ -24,6 +24,7 @@ from typing import Optional, List
 from logging.handlers import RotatingFileHandler
 
 import aiosqlite
+import sqlite3
 import pytz
 
 
