@@ -52,10 +52,12 @@ X_BEARER_TOKEN=...
 TZ=Europe/Belgrade
 POST_SLOTS=10:00,13:00,16:00,19:00,22:00
 POSTBOT_STORAGE_DIR=storage
+# Глобальная подпись для X.com (поддерживает HTML)
+POSTBOT_SIGNATURE="\n\n✨ Join our private channel: https://t.me/+BFaD3NqIEARiZmZi\n#peach #juicy #exclusive"
 EOF
 ```
 
-> `TG_CHANNEL` и `TG_CHANNEL_ID` взаимоисключающие: используйте только одно.
+> `TG_CHANNEL` и `TG_CHANNEL_ID` взаимоисключающие. `POSTBOT_SIGNATURE` добавляется автоматически **только** при постинге в X.com.
 
 ### Изменение настроек времени
 

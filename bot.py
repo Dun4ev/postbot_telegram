@@ -219,6 +219,15 @@ async def db_init() -> None:
     logger.info("Инициализация базы данных: %s", DB_PATH)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_SQL)
+        
+        # Миграция: добавляем колонку target, если её нет (для старых инсталляций)
+        try:
+            await db.execute("ALTER TABLE queue ADD COLUMN target TEXT NOT NULL DEFAULT 'both'")
+            logger.info("База данных обновлена: добавлена колонка 'target'")
+        except sqlite3.OperationalError:
+            # Колонка уже существует
+            pass
+            
         await db.commit()
 
 async def save_media_locally(bot, file_id: str, kind: str) -> str:
