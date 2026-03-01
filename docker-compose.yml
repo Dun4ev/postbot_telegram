@@ -10,8 +10,8 @@ services:
       "pip install --no-cache-dir -r requirements.txt
       && python bot.py"
     volumes:
-      - /volume1/docker/postbot:/app
-      - /volume1/docker/storage:/app/storage
+      - /volume1/docker/postbot/repo:/app
+      - /volume1/docker/postbot/storage:/app/storage
     restart: unless-stopped
     logging:
       driver: json-file

@@ -18,17 +18,16 @@
    ```bash
    ssh admin@<synology-ip>
    ```
-2. Создайте рабочую папку (если ещё не существует):
+2. Создайте рабочую папку и подпапку для медиа:
    ```bash
-   mkdir -p /volume1/docker/postbot
+   mkdir -p /volume1/docker/postbot/storage
    ```
-3. Клонируйте проект в каталог:
+3. Клонируйте проект в подпапку `repo`:
    ```bash
    cd /volume1/docker/postbot
-   git clone https://github.com/Dun4ev/postbot_telegram.git .
+   git clone https://github.com/Dun4ev/postbot_telegram.git repo
+   cd repo
    ```
-
-   Допускается синхронизация через Synology Drive/SFTP. Главное — чтобы структура файлов совпадала с репозиторием.
 
 ## 3. Переменные окружения
 
@@ -67,16 +66,14 @@ EOF
 
 Пересобирать контейнер не нужно — код монтируется как volume.
 
-## 4. Проверка `docker-compose.yml`
-
 - Файл поставляется в репозитории и ожидает монтирование каталога проекта в `/app`.
-- **Важно:** Для хранения медиа рекомендуется монтировать папку `storage` на отдельный путь (например, `/volume1/tgqueue/storage`), чтобы файлы не терялись при пересборке проекта. Пример в `docker-compose.yml`:
+- **Структура папок:**
   ```yaml
   volumes:
-    - /volume1/docker/postbot:/app
-    - /volume1/tgqueue/storage:/app/storage
+    - /volume1/docker/postbot/repo:/app
+    - /volume1/docker/postbot/storage:/app/storage
   ```
-- Команда запуска внутри контейнера устанавливает зависимости из `requirements.txt`, включая `tweepy` для X.com.
+- Команда запуска внутри контейнера устанавливает зависимости из `requirements.txt`.
 - Для валидации конфигурации выполните:
   ```bash
   docker compose config
@@ -99,13 +96,10 @@ EOF
 
 ### Вариант B: через SSH (командная строка)
 
-1. Убедитесь, что Container Manager активен:
-   ```bash
-   synoservice --status pkgctl-ContainerManager
-   ```
+1. Убедитесь, что Container Manager активен.
 2. Соберите и запустите сервис:
    ```bash
-   cd /volume1/docker/postbot
+   cd /volume1/docker/postbot/repo
    docker compose up -d --build
    ```
 3. Контроль логов:
