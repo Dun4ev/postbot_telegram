@@ -385,7 +385,7 @@ def _handle_media_group(
             MAX_ALBUM_ITEMS,
         )
 
-    _schedule_album_flush(context, media_group_id)
+    _schedule_album_flush(context, media_group_id, message.chat_id)
     return True
 
 
@@ -687,6 +687,11 @@ async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
     caption = update.message.caption or ""
     
+    # 📚 Проверка на альбом (media_group_id)
+    if _handle_media_group(update, context, "photo", photo.file_id, caption):
+        # Альбом перехвачен, h_photo завершается, ждем сброса буфера
+        return
+    
     path = await save_media_locally(context.bot, photo.file_id, "photo")
     
     # Сохраняем в активы "золотого фонда"
@@ -709,6 +714,10 @@ async def h_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Получено видео от %s", _actor(update))
     video = update.message.video
     caption = update.message.caption or ""
+    
+    # 📚 Проверка на альбом (media_group_id)
+    if _handle_media_group(update, context, "video", video.file_id, caption):
+        return
     
     path = await save_media_locally(context.bot, video.file_id, "video")
     
