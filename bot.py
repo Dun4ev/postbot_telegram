@@ -544,16 +544,6 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Бот жив, {size} сообщений в очереди, ближайший слот {slot_txt}"
     )
 
-async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.warning("Команда /purge от %s", _actor(update))
-    await purge()
-    _album_buffer(context).clear()
-    jobs = _album_jobs(context)
-    for job in jobs.values():
-        job.schedule_removal()
-    jobs.clear()
-    await update.message.reply_text("Очередь очищена 🧹")
-
 async def cmd_publish_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Принудительно публикует следующий элемент из очереди прямо сейчас.
@@ -915,7 +905,6 @@ async def post_init(application: Application) -> None:
         BotCommand("now", "Опубликовать следующий пост сейчас"),
         BotCommand("restock", "Пополнить очередь из архива"),
         BotCommand("health", "Статус бота и слотов"),
-        BotCommand("purge", "Очистить очередь (ОПАСНО)"),
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Меню команд успешно установлено")
@@ -929,7 +918,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("health", cmd_health))
-    app.add_handler(CommandHandler("purge", cmd_purge))
     app.add_handler(CommandHandler("now", cmd_publish_now))
     app.add_handler(CommandHandler("publish_now", cmd_publish_now))
     app.add_handler(CommandHandler("restock", cmd_restock))
