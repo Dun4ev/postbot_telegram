@@ -436,51 +436,60 @@ async def sync_storage_to_db():
     logger.info("Начало синхронизации папки %s с базой данных...", STORAGE_DIR)
     added_assets = 0
     added_queue = 0
+    
+    # Собираем все файлы для сортировки
+    all_files = []
+    for root, dirs, files in os.walk(STORAGE_DIR):
+        for file in files:
+            # Игнорируем скрытые и системные файлы
+            if file.startswith('.') or file == "postbot.log" or "@eaDir" in root or "@eaDir" in file:
+                continue
+            
+            full_path = os.path.join(root, file)
+            rel_path = os.path.relpath(full_path, os.getcwd())
+            all_files.append((rel_path, file))
+
+    # Сортируем по пути (чтобы 2025 шел перед 2026)
+    all_files.sort(key=lambda x: x[0])
 
     async with aiosqlite.connect(DB_PATH) as db:
-        for root, dirs, files in os.walk(STORAGE_DIR):
-            for file in files:
-                if file.startswith('.') or file == "postbot.log" or "@eaDir" in root or "@eaDir" in file:
-                    continue
+        for rel_path, file in all_files:
+            # Ищем в assets
+            async with db.execute("SELECT id, is_published FROM assets WHERE path = ?", (rel_path,)) as cur:
+                asset = await cur.fetchone()
+            
+            asset_id = None
+            is_published = 0
+            
+            if not asset:
+                # Добавляем в assets
+                ext = file.split('.')[-1].lower()
+                kind = "photo" if ext in ("jpg", "jpeg", "png", "webp") else "video"
+                cur = await db.execute(
+                    "INSERT INTO assets (path, kind, source) VALUES (?, ?, ?)",
+                    (rel_path, kind, "sync")
+                )
+                asset_id = cur.lastrowid
+                added_assets += 1
+                logger.debug("Синхронизация: файл %s добавлен в assets", rel_path)
+            else:
+                asset_id, is_published = asset
+
+            if not is_published:
+                # Проверяем, нет ли его уже в очереди
+                async with db.execute("SELECT id FROM queue WHERE asset_id = ?", (asset_id,)) as cur:
+                    in_queue = await cur.fetchone()
                 
-                rel_path = os.path.relpath(os.path.join(root, file), os.getcwd())
-                
-                # Ищем в assets
-                async with db.execute("SELECT id, is_published FROM assets WHERE path = ?", (rel_path,)) as cur:
-                    asset = await cur.fetchone()
-                
-                asset_id = None
-                is_published = 0
-                
-                if not asset:
-                    # Добавляем в assets
+                if not in_queue:
+                    # Добавляем в конец очереди
                     ext = file.split('.')[-1].lower()
                     kind = "photo" if ext in ("jpg", "jpeg", "png", "webp") else "video"
-                    cur = await db.execute(
-                        "INSERT INTO assets (path, kind, source) VALUES (?, ?, ?)",
-                        (rel_path, kind, "sync")
+                    await db.execute(
+                        "INSERT INTO queue (kind, payload, asset_id) VALUES (?, ?, ?)",
+                        (kind, rel_path, asset_id)
                     )
-                    asset_id = cur.lastrowid
-                    added_assets += 1
-                    logger.debug("Синхронизация: файл %s добавлен в assets", rel_path)
-                else:
-                    asset_id, is_published = asset
-
-                if not is_published:
-                    # Проверяем, нет ли его уже в очереди
-                    async with db.execute("SELECT id FROM queue WHERE asset_id = ?", (asset_id,)) as cur:
-                        in_queue = await cur.fetchone()
-                    
-                    if not in_queue:
-                        # Добавляем в конец очереди
-                        ext = file.split('.')[-1].lower()
-                        kind = "photo" if ext in ("jpg", "jpeg", "png", "webp") else "video"
-                        await db.execute(
-                            "INSERT INTO queue (kind, payload, asset_id) VALUES (?, ?, ?)",
-                            (kind, rel_path, asset_id)
-                        )
-                        added_queue += 1
-                        logger.debug("Синхронизация: файл %s добавлен в очередь", rel_path)
+                    added_queue += 1
+                    logger.debug("Синхронизация: файл %s добавлен в очередь", rel_path)
         
         await db.commit()
     
@@ -663,9 +672,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await enqueue(kind, payload, caption, target, asset_id)
     context.user_data.pop("pending_post", None)
     
+    # Получаем текущий размер очереди для отображения позиции
+    total_size = await queue_size()
+    
     target_names = {"tg": "Telegram", "x": "X.com", "both": "Везде"}
-    logger.info("Пост (#%s) добавлен в очередь для %s", kind, target_names[target])
-    await query.edit_message_text(f"✅ Добавлено в очередь! Назначение: {target_names[target]}")
+    logger.info("Пост (%s) добавлен в очередь для %s", kind, target_names[target])
+    await query.edit_message_text(
+        f"✅ Добавлено в очередь! Назначение: {target_names[target]}\n"
+        f"📊 Твоя позиция в очереди: <b>{total_size}</b>"
+    , parse_mode=ParseMode.HTML)
 
 async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Получено фото от %s", _actor(update))
