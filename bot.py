@@ -436,7 +436,7 @@ async def sync_storage_to_db():
     async with aiosqlite.connect(DB_PATH) as db:
         for root, dirs, files in os.walk(STORAGE_DIR):
             for file in files:
-                if file.startswith('.') or file == "postbot.log":
+                if file.startswith('.') or file == "postbot.log" or "@eaDir" in root or "@eaDir" in file:
                     continue
                 
                 rel_path = os.path.relpath(os.path.join(root, file), os.getcwd())
@@ -854,7 +854,6 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Ошибка публикации элемента #%s", item.id)
     else:
         logger.info("Элемент #%s опубликован", item.id)
-        # Помечаем в архиве как опубликованный
         if item.asset_id:
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE assets SET is_published = 1 WHERE id = ?", (item.asset_id,))
