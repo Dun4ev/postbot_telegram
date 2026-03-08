@@ -289,7 +289,7 @@ def _album_jobs(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.application.bot_data.setdefault(ALBUM_FLUSH_JOBS_KEY, {})
 
 
-def _schedule_album_flush(context: ContextTypes.DEFAULT_TYPE, media_group_id: str, chat_id: int) -> None:
+def _schedule_album_flush(context: ContextTypes.DEFAULT_TYPE, media_group_id: str, chat_id: int, user_id: int) -> None:
     jobs = _album_jobs(context)
     if existing := jobs.pop(media_group_id, None):
         existing.schedule_removal()
@@ -297,7 +297,9 @@ def _schedule_album_flush(context: ContextTypes.DEFAULT_TYPE, media_group_id: st
     job = context.job_queue.run_once(
         _flush_album_buffer,
         when=3,
-        data={"media_group_id": media_group_id, "chat_id": chat_id},  # Передаем chat_id
+        chat_id=chat_id,
+        user_id=user_id,
+        data={"media_group_id": media_group_id, "chat_id": chat_id},
         name=f"flush_album_{media_group_id}",
     )
     jobs[media_group_id] = job
@@ -385,7 +387,7 @@ def _handle_media_group(
             MAX_ALBUM_ITEMS,
         )
 
-    _schedule_album_flush(context, media_group_id, message.chat_id)
+    _schedule_album_flush(context, media_group_id, message.chat_id, update.effective_user.id)
     return True
 
 
