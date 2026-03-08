@@ -507,35 +507,39 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Ошибка в cmd_start: %s", e)
 
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Команда /queue от %s", _actor(update))
-    items = await peek_many(20)
-    if not items:
-        await update.message.reply_text("Очередь пуста ✅")
-        return
-    lines = []
-    icon_by_kind = {
-        "text": "📝",
-        "photo": "🖼️",
-        "video": "🎞️",
-        "album": "📚",
-    }
-    for it in items:
-        icon = icon_by_kind.get(it.kind, "❔")
-        if it.kind == "album":
-            try:
-                album_items = json.loads(it.payload)
-            except json.JSONDecodeError:
-                album_items = []
-            caption = (it.caption or "").replace("\n", " ")[:50]
-            preview = f"{len(album_items)} media"
-            if caption:
-                preview = f"{preview} — {caption}"
-        else:
-            has_caption = it.kind in {"photo", "video"} and it.caption
-            preview_src = it.caption if has_caption else it.payload
-            preview = (preview_src or "").replace("\n", " ")[:70]
-        lines.append(f"{icon} #{it.id}  {preview}")
-    await update.message.reply_text("Ближайшие посты:\n" + "\n".join(lines))
+    try:
+        logger.info("Команда /queue от %s", _actor(update))
+        items = await peek_many(20)
+        if not items:
+            await update.message.reply_text("Очередь пуста ✅")
+            return
+        lines = []
+        icon_by_kind = {
+            "text": "📝",
+            "photo": "🖼️",
+            "video": "🎞️",
+            "album": "📚",
+        }
+        for it in items:
+            icon = icon_by_kind.get(it.kind, "❔")
+            if it.kind == "album":
+                try:
+                    album_items = json.loads(it.payload)
+                except json.JSONDecodeError:
+                    album_items = []
+                caption = (it.caption or "").replace("\n", " ")[:50]
+                preview = f"{len(album_items)} media"
+                if caption:
+                    preview = f"{preview} — {caption}"
+            else:
+                has_caption = it.kind in {"photo", "video"} and it.caption
+                preview_src = it.caption if has_caption else it.payload
+                preview = (preview_src or "").replace("\n", " ")[:70]
+            lines.append(f"{icon} #{it.id}  {preview}")
+        await update.message.reply_text("Ближайшие посты:\n" + "\n".join(lines))
+    except Exception as e:
+        logger.exception("Ошибка в cmd_queue: %s", e)
+        await update.message.reply_text("⚠️ Ошибка при чтении очереди.")
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -566,32 +570,43 @@ async def cmd_publish_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_restock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Берет N случайных элементов из assets и добавляет их в очередь.
+    Берет N случайных элементов из неопубликованных assets и добавляет их в очередь.
     Использование: /restock [количество]
     """
-    logger.info("Команда /restock от %s", _actor(update))
-    args = context.args
-    count = 5
-    if args and args[0].isdigit():
-        count = int(args[0])
-    
-    # Ограничим разумным пределом
-    count = min(max(count, 1), 50)
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Берем случайные элементы, которые еще не в текущей очереди
-        # (упрощенно: просто случайные из assets)
-        async with db.execute(
-            "SELECT path, kind, caption FROM assets ORDER BY RANDOM() LIMIT ?", 
-            (count,)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            
-        for path, kind, caption in rows:
-            await enqueue(kind, path, caption, target="both")
-        await db.commit()
-    
-    await update.message.reply_text(f"✅ Очередь пополнена: добавлено {len(rows)} случайных постов из архива.")
+    try:
+        logger.info("Команда /restock от %s", _actor(update))
+        args = context.args
+        count = 10
+        if args and args[0].isdigit():
+            count = int(args[0])
+        
+        count = min(max(count, 1), 100)
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Берем только то, что еще не опубликовано и не в очереди
+            query = """
+                SELECT id, path, kind, caption 
+                FROM assets 
+                WHERE is_published = 0 
+                  AND id NOT IN (SELECT asset_id FROM queue WHERE asset_id IS NOT NULL)
+                ORDER BY id ASC 
+                LIMIT ?
+            """
+            async with db.execute(query, (count,)) as cursor:
+                rows = await cursor.fetchall()
+                
+            if not rows:
+                await update.message.reply_text("Нет новых материалов для добавления в очередь.")
+                return
+
+            for a_id, path, kind, caption in rows:
+                await enqueue(kind, path, caption, target="both", asset_id=a_id)
+            await db.commit()
+        
+        await update.message.reply_text(f"✅ Очередь успешно пополнена: добавлено {len(rows)} новых постов.")
+    except Exception as e:
+        logger.exception("Ошибка в cmd_restock: %s", e)
+        await update.message.reply_text("⚠️ Ошибка при пополнении очереди.")
 
 async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
