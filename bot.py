@@ -495,13 +495,16 @@ def _actor(update: Update) -> str:
 # ---------------------- Handlers ----------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    slots_txt = ", ".join([s.strftime("%H:%M") for s in DAILY_SLOTS])
-    logger.info("Команда /start от %s", _actor(update))
-    await update.message.reply_text(
-        "Привет! Кидай мне текст, фото или видео с подписью — я поставлю в очередь.\n"
-        f"Публикую в канале по слотам: {slots_txt} ({TZ_NAME}).\n"
-        "Команды: /queue — показать очередь; /purge — очистить."
-    )
+    try:
+        slots_txt = ", ".join([s.strftime("%H:%M") for s in DAILY_SLOTS])
+        logger.info("Команда /start от %s", _actor(update))
+        await update.message.reply_text(
+            "Привет! Кидай мне текст, фото или видео с подписью — я поставлю в очередь.\n"
+            f"Публикую в канале по слотам: {slots_txt} ({TZ_NAME}).\n"
+            "Команды: /queue — показать очередь; /health — статус бота; /now — пост сейчас."
+        )
+    except Exception as e:
+        logger.exception("Ошибка в cmd_start: %s", e)
 
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Команда /queue от %s", _actor(update))
@@ -535,14 +538,18 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Ближайшие посты:\n" + "\n".join(lines))
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Команда /health от %s", _actor(update))
-    size = await queue_size()
-    now_local = datetime.now(TZ)
-    slot = _compute_next_slot(now_local)
-    slot_txt = slot.strftime("%H:%M") if slot else "—"
-    await update.message.reply_text(
-        f"Бот жив, {size} сообщений в очереди, ближайший слот {slot_txt}"
-    )
+    try:
+        logger.info("Команда /health от %s", _actor(update))
+        size = await queue_size()
+        now_local = datetime.now(TZ)
+        slot = _compute_next_slot(now_local)
+        slot_txt = slot.strftime("%H:%M") if slot else "—"
+        await update.message.reply_text(
+            f"Бот жив, {size} сообщений в очереди, ближайший слот {slot_txt}"
+        )
+    except Exception as e:
+        logger.exception("Ошибка в cmd_health: %s", e)
+        await update.message.reply_text("⚠️ Ошибка при проверке статуса.")
 
 async def cmd_publish_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -895,7 +902,7 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application) -> None:
     """
-    Устанавливает меню команд в Telegram при запуске.
+    Выполняется при старте бота.
     """
     from telegram import BotCommand
     commands = [
@@ -907,6 +914,14 @@ async def post_init(application: Application) -> None:
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Меню команд успешно установлено")
+    
+    # Инициализация БД и синхронизация при старте
+    try:
+        await db_init()
+        if AUTO_SYNC:
+            await sync_storage_to_db()
+    except Exception as e:
+        logger.error("Ошибка при инициализации/синхронизации: %s", e)
 
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(2).post_init(post_init).build()
@@ -957,43 +972,27 @@ def build_app() -> Application:
 
 
 def main():
-    logger.info("Запуск цикла приложения")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # Инициализация БД и синхронизация
-    loop.run_until_complete(db_init())
-    if AUTO_SYNC:
-        loop.run_until_complete(sync_storage_to_db())
+    try:
+        logger.info("Запуск приложения")
+        app = build_app()
         
-    app = build_app()
-
-    # Бережный long-polling:
-    # - poll_interval=0.0 — без пауз между вызовами getUpdates (сервер держит соединение)
-    # - timeout=25        — длинный таймаут long-poll на стороне Telegram
-    # - read_timeout=35   — ждём сеть подольше (NAT, DSM)
-    # - allowed_updates   — только "message", чтобы не тянуть лишнее
-    # - drop_pending_updates=True — не забирать старые апдейты из истории при рестарте
-    logger.info("Старт long-polling")
-    app.run_polling(
-        poll_interval=0.0,
-        timeout=25,
-        read_timeout=35,
-        allowed_updates=["message", "callback_query"],
-        drop_pending_updates=True,
-        stop_signals=None,   # корректно завершится по Ctrl+C/kill
-    )
-
-    logger.info("Пуллинг завершён, очищаем контекст event loop")
-    asyncio.set_event_loop(None)
+        logger.info("Старт long-polling...")
+        # run_polling блокирует поток до завершения работы приложения
+        app.run_polling(
+            poll_interval=0.0,
+            timeout=25,
+            read_timeout=35,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True
+        )
+    except Exception:
+        logger.exception("Критическая ошибка при работе бота")
+    finally:
+        logger.info("Приложение остановлено")
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 if __name__ == "__main__":
-    # Универсально: работает корректно в консольном режиме
-    try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("Получен KeyboardInterrupt — завершаемся по запросу оператора")
+    main()
