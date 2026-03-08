@@ -187,6 +187,10 @@ class QueueItem:
 
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS queue (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind     TEXT    NOT NULL,
+  payload  TEXT    NOT NULL,
+  caption  TEXT    NOT NULL DEFAULT '',
   target   TEXT    NOT NULL DEFAULT 'both',
   asset_id INTEGER,
   created  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
