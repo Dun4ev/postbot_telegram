@@ -165,7 +165,13 @@ logger.info(
 
 DB_PATH = "queue.db"
 STORAGE_DIR = os.getenv("POSTBOT_STORAGE_DIR", "storage")
+ADMIN_ID_RAW = os.getenv("POSTBOT_ADMIN_ID")
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW and ADMIN_ID_RAW.isdigit() else None
+AUTO_SYNC = os.getenv("POSTBOT_AUTO_SYNC", "1") == "1"
+
 logger.info("Файл очереди: %s, Директория хранения: %s", DB_PATH, STORAGE_DIR)
+if ADMIN_ID:
+    logger.info("ID администратора для отчетов: %s", ADMIN_ID)
 
 
 # ---------------------- Data model / storage ----------------------
@@ -177,14 +183,12 @@ class QueueItem:
     payload: str     # text or LOCAL PATH (or JSON for album)
     caption: str     # optional
     target: str      # 'tg' | 'x' | 'both'
+    asset_id: Optional[int] = None
 
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS queue (
-  id       INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind     TEXT    NOT NULL,
-  payload  TEXT    NOT NULL,
-  caption  TEXT    NOT NULL DEFAULT '',
   target   TEXT    NOT NULL DEFAULT 'both',
+  asset_id INTEGER,
   created  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 
@@ -194,6 +198,7 @@ CREATE TABLE IF NOT EXISTS assets (
   kind         TEXT    NOT NULL,
   caption      TEXT    NOT NULL DEFAULT '',
   source       TEXT    NOT NULL DEFAULT 'direct',
+  is_published INTEGER NOT NULL DEFAULT 0,
   created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 """
@@ -221,14 +226,18 @@ async def db_init() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_SQL)
         
-        # Миграция: добавляем колонку target, если её нет (для старых инсталляций)
         try:
-            await db.execute("ALTER TABLE queue ADD COLUMN target TEXT NOT NULL DEFAULT 'both'")
-            logger.info("База данных обновлена: добавлена колонка 'target'")
+            await db.execute("ALTER TABLE queue ADD COLUMN asset_id INTEGER")
+            logger.info("База данных обновлена: добавлена колонка 'asset_id' в queue")
         except sqlite3.OperationalError:
-            # Колонка уже существует
             pass
-            
+
+        try:
+            await db.execute("ALTER TABLE assets ADD COLUMN is_published INTEGER NOT NULL DEFAULT 0")
+            logger.info("База данных обновлена: добавлена колонка 'is_published' в assets")
+        except sqlite3.OperationalError:
+            pass
+
         await db.commit()
 
 async def save_media_locally(bot, file_id: str, kind: str) -> str:
@@ -255,15 +264,15 @@ async def save_media_locally(bot, file_id: str, kind: str) -> str:
     logger.info("Файл сохранен локально: %s", rel_path)
     return rel_path
 
-async def enqueue(kind: str, payload: str, caption: str = "", target: str = "both") -> None:
+async def enqueue(kind: str, payload: str, caption: str = "", target: str = "both", asset_id: Optional[int] = None) -> None:
     logger.info(
-        "Элемент добавлен в очередь: тип=%s, цель=%s, длина_данных=%d",
-        kind, target, len(payload or "")
+        "Элемент добавлен в очередь: тип=%s, цель=%s, asset_id=%s, длина_данных=%d",
+        kind, target, asset_id, len(payload or "")
     )
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO queue (kind, payload, caption, target) VALUES (?, ?, ?, ?)",
-            (kind, payload, caption or "", target)
+            "INSERT INTO queue (kind, payload, caption, target, asset_id) VALUES (?, ?, ?, ?, ?)",
+            (kind, payload, caption or "", target, asset_id)
         )
         await db.commit()
 
@@ -313,13 +322,14 @@ async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
     payload = json.dumps(items_with_local_paths)
     
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+        cur = await db.execute(
             "INSERT INTO assets (path, kind, caption, source) VALUES (?, ?, ?, ?)",
             (payload, "album", caption, "direct")
         )
+        asset_id = cur.lastrowid
         await db.commit()
     
-    context.user_data["pending_post"] = {"kind": "album", "payload": payload, "caption": caption}
+    context.user_data["pending_post"] = {"kind": "album", "payload": payload, "caption": caption, "asset_id": asset_id}
     
     if chat_id:
         await context.bot.send_message(
@@ -378,7 +388,7 @@ def _handle_media_group(
 async def dequeue() -> Optional[QueueItem]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, kind, payload, caption, target FROM queue ORDER BY id LIMIT 1"
+            "SELECT id, kind, payload, caption, target, asset_id FROM queue ORDER BY id LIMIT 1"
         ) as cursor:
             row = await cursor.fetchone()
             if row:
@@ -392,7 +402,7 @@ async def dequeue() -> Optional[QueueItem]:
 async def peek_many(n: int = 10) -> List[QueueItem]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, kind, payload, caption, target FROM queue ORDER BY id ASC LIMIT ?",
+            "SELECT id, kind, payload, caption, target, asset_id FROM queue ORDER BY id ASC LIMIT ?",
             (n,)
         )
         rows = await cur.fetchall()
@@ -409,6 +419,68 @@ async def purge() -> None:
         await db.execute("DELETE FROM queue")
         await db.commit()
     logger.warning("Очередь очищена")
+
+
+async def sync_storage_to_db():
+    """
+    Сканирует папку storage и синхронизирует её с assets и queue.
+    """
+    if not os.path.exists(STORAGE_DIR):
+        os.makedirs(STORAGE_DIR, exist_ok=True)
+        return
+
+    logger.info("Начало синхронизации папки %s с базой данных...", STORAGE_DIR)
+    added_assets = 0
+    added_queue = 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for root, dirs, files in os.walk(STORAGE_DIR):
+            for file in files:
+                if file.startswith('.') or file == "postbot.log":
+                    continue
+                
+                rel_path = os.path.relpath(os.path.join(root, file), os.getcwd())
+                
+                # Ищем в assets
+                async with db.execute("SELECT id, is_published FROM assets WHERE path = ?", (rel_path,)) as cur:
+                    asset = await cur.fetchone()
+                
+                asset_id = None
+                is_published = 0
+                
+                if not asset:
+                    # Добавляем в assets
+                    ext = file.split('.')[-1].lower()
+                    kind = "photo" if ext in ("jpg", "jpeg", "png", "webp") else "video"
+                    cur = await db.execute(
+                        "INSERT INTO assets (path, kind, source) VALUES (?, ?, ?)",
+                        (rel_path, kind, "sync")
+                    )
+                    asset_id = cur.lastrowid
+                    added_assets += 1
+                    logger.debug("Синхронизация: файл %s добавлен в assets", rel_path)
+                else:
+                    asset_id, is_published = asset
+
+                if not is_published:
+                    # Проверяем, нет ли его уже в очереди
+                    async with db.execute("SELECT id FROM queue WHERE asset_id = ?", (asset_id,)) as cur:
+                        in_queue = await cur.fetchone()
+                    
+                    if not in_queue:
+                        # Добавляем в конец очереди
+                        ext = file.split('.')[-1].lower()
+                        kind = "photo" if ext in ("jpg", "jpeg", "png", "webp") else "video"
+                        await db.execute(
+                            "INSERT INTO queue (kind, payload, asset_id) VALUES (?, ?, ?)",
+                            (kind, rel_path, asset_id)
+                        )
+                        added_queue += 1
+                        logger.debug("Синхронизация: файл %s добавлен в очередь", rel_path)
+        
+        await db.commit()
+    
+    logger.info("Синхронизация завершена: +%d в архив, +%d в очередь", added_assets, added_queue)
 
 
 def _actor(update: Update) -> str:
@@ -570,8 +642,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kind = pending["kind"]
     payload = pending["payload"]
     caption = pending["caption"]
+    asset_id = pending.get("asset_id")
     
-    await enqueue(kind, payload, caption, target)
+    await enqueue(kind, payload, caption, target, asset_id)
     context.user_data.pop("pending_post", None)
     
     target_names = {"tg": "Telegram", "x": "X.com", "both": "Везде"}
@@ -587,14 +660,15 @@ async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Сохраняем в активы "золотого фонда"
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+        cur = await db.execute(
             "INSERT INTO assets (path, kind, caption, source) VALUES (?, ?, ?, ?)",
             (path, "photo", caption, "direct")
         )
+        asset_id = cur.lastrowid
         await db.commit()
     
     # Вместо немедленной очереди — спрашиваем
-    context.user_data["pending_post"] = {"kind": "photo", "payload": path, "caption": caption}
+    context.user_data["pending_post"] = {"kind": "photo", "payload": path, "caption": caption, "asset_id": asset_id}
     await update.message.reply_text(
         "🖼️ Фото сохранено. Куда его опубликовать?", 
         reply_markup=_get_selection_keyboard("photo", path, caption)
@@ -608,13 +682,14 @@ async def h_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = await save_media_locally(context.bot, video.file_id, "video")
     
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+        cur = await db.execute(
             "INSERT INTO assets (path, kind, caption, source) VALUES (?, ?, ?, ?)",
             (path, "video", caption, "direct")
         )
+        asset_id = cur.lastrowid
         await db.commit()
 
-    context.user_data["pending_post"] = {"kind": "video", "payload": path, "caption": caption}
+    context.user_data["pending_post"] = {"kind": "video", "payload": path, "caption": caption, "asset_id": asset_id}
     await update.message.reply_text(
         "📹 Видео сохранено. Куда его опубликовать?", 
         reply_markup=_get_selection_keyboard("video", path, caption)
@@ -789,6 +864,43 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Ошибка публикации элемента #%s", item.id)
     else:
         logger.info("Элемент #%s опубликован", item.id)
+        # Помечаем в архиве как опубликованный
+        if item.asset_id:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE assets SET is_published = 1 WHERE id = ?", (item.asset_id,))
+                await db.commit()
+                logger.debug("Статус актива #%s обновлен: is_published = 1", item.asset_id)
+
+
+async def daily_report(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Отправляет ежедневный отчет администратору о состоянии очереди.
+    """
+    if not ADMIN_ID:
+        logger.warning("ADMIN_ID не настроен, отчет не отправлен")
+        return
+
+    size = await queue_size()
+    slots_count = len(DAILY_SLOTS)
+    days_left = size / slots_count if slots_count > 0 else 0
+    
+    msg = (
+        "📊 <b>Ежедневный отчет по контенту</b>\n\n"
+        f"🔹 Всего в очереди: <b>{size}</b> постов\n"
+        f"🔹 Слотов в день: <b>{slots_count}</b>\n"
+        f"🔹 Контента хватит на: <b>{days_left:.1f}</b> дн.\n\n"
+    )
+    
+    if days_left < 3:
+        msg += "⚠️ <b>ВНИМАНИЕ:</b> Контент заканчивается! Пора пополнить архив."
+    else:
+        msg += "✅ Всё в порядке, постинг продолжается."
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode=ParseMode.HTML)
+        logger.info("Ежедневный отчет успешно отправлен админу %s", ADMIN_ID)
+    except Exception as e:
+        logger.error("Не удалось отправить отчет админу: %s", e)
 
 # ---------------------- Application / Polling ----------------------
 
@@ -837,13 +949,36 @@ def build_app() -> Application:
             name=f"slot_{t.strftime('%H%M')}"
         )
     logger.info("Планировщик инициализирован: %d слотов", len(DAILY_SLOTS))
+
+    # Планируем отчет за 30 минут до первого слота
+    if DAILY_SLOTS:
+        first_slot = min(DAILY_SLOTS, key=lambda t: (t.hour, t.minute))
+        # Считаем время отчета (на 30 минут раньше)
+        report_minutes = first_slot.hour * 60 + first_slot.minute - 30
+        if report_minutes < 0:
+            report_minutes += 24 * 60
+        
+        report_time = dtime(report_minutes // 60, report_minutes % 60, tzinfo=TZ)
+        app.job_queue.run_daily(
+            daily_report,
+            time=report_time,
+            name="daily_content_report"
+        )
+        logger.info("Ежедневный отчет запланирован на %s", report_time.strftime("%H:%M"))
+
     return app
+
 
 def main():
     logger.info("Запуск цикла приложения")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    
+    # Инициализация БД и синхронизация
     loop.run_until_complete(db_init())
+    if AUTO_SYNC:
+        loop.run_until_complete(sync_storage_to_db())
+        
     app = build_app()
 
     # Бережный long-polling:
