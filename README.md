@@ -67,3 +67,24 @@ pytest -q
 - **Расписание** — задавайте `TZ` и `POST_SLOTS` только валидными значениями (`Europe/Moscow`, `HH:MM`); для быстрой отладки удобно указывать ближайший слот через `export POST_SLOTS="$(date -v+5M +%H:%M)"`.
 - **Мониторинг** — включите логирование stdout в файл (например, `python bot.py >> bot.log 2>&1`) и настройте уведомления при повторяющихся `Publish error`.
 - **Резервное копирование** — храните бэкап `queue.db` и `.env` (без токенов в открытом виде) если очередь критична.
+
+## Настройка X (Twitter) API
+
+Для автоматической публикации в X (Twitter) вам необходимо получить 5 ключей на [developer.x.com](https://developer.x.com/):
+
+1. **Создайте проект и приложение**:
+   - Выберите уровень доступа **"Free"** или **"Basic"**.
+   - Тип приложения: **"Web App, Automated App or Bot"**.
+
+2. **Настройте права доступа (User authentication settings)**:
+   - **ВАЖНО**: Установите App Permissions в режим **"Read and Write"**.
+   - Включите **OAuth 1.0a**.
+   - Callback URI / Redirect URL: `https://x.com`
+   - Website URL: `https://x.com`
+
+3. **Получите ключи (Keys and Tokens)**:
+   - **API Key & Secret**: Это `Consumer Keys`.
+   - **Access Token & Secret**: Генерируются в разделе `Authentication Tokens` (только после настройки "Read and Write"!).
+   - **Bearer Token**: Из соответствующего раздела.
+
+4. **Заполните .env**: Перенесите полученные значения в файл `.env` и убедитесь, что `X_ENABLED=1`.
