@@ -141,12 +141,16 @@ logger.info("Таймзона запланированных публикаци�
 def _parse_slots_from_env() -> List[dtime]:
     raw = os.getenv("POST_SLOTS", "07:30,11:30,14:05,17:30,21:34")
     slots: List[dtime] = []
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        hh, mm = chunk.split(":")
-        slots.append(dtime(int(hh), int(mm), tzinfo=TZ))
+    try:
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            hh, mm = chunk.split(":")
+            slots.append(dtime(int(hh), int(mm), tzinfo=TZ))
+    except ValueError as exc:
+        logger.critical("Некорректный POST_SLOTS=%r. Ожидается формат HH:MM,HH:MM", raw)
+        raise SystemExit("Set POST_SLOTS in HH:MM,HH:MM format") from exc
     return slots
 
 POSTBOT_SIGNATURE = os.getenv("POSTBOT_SIGNATURE", "")
@@ -279,6 +283,19 @@ async def enqueue(kind: str, payload: str, caption: str = "", target: str = "bot
             (kind, payload, caption or "", target, asset_id)
         )
         await db.commit()
+
+
+async def requeue_item(item: QueueItem, target: Optional[str] = None) -> None:
+    """
+    Возвращает элемент в хвост очереди, сохраняя назначение и связь с архивом.
+    """
+    await enqueue(
+        item.kind,
+        item.payload,
+        item.caption,
+        target=target or item.target,
+        asset_id=item.asset_id,
+    )
 
 
 def _album_buffer(context: ContextTypes.DEFAULT_TYPE) -> dict:
@@ -628,19 +645,21 @@ async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
     logger.info("Получен текст от %s (длина=%d)", _actor(update), len(text))
-    await enqueue("text", text, "")
-    await update.message.reply_text("Добавил в очередь 🧾")
+    context.user_data["pending_post"] = {
+        "kind": "text",
+        "payload": text,
+        "caption": "",
+        "asset_id": None,
+    }
+    await update.message.reply_text(
+        "🧾 Текст сохранен. Куда его опубликовать?",
+        reply_markup=_get_selection_keyboard("text", text),
+    )
 
 # ---------------------- Handlers ----------------------
 
 def _get_selection_keyboard(kind: str, payload: str, caption: str = "") -> InlineKeyboardMarkup:
     """Создает кнопки для выбора платформы."""
-    # Мы кодируем данные в callback_data. 
-    # Так как лимит 64 символа, для альбомов (JSON) и длинных путей 
-    # мы будем использовать временное хранилище в context или просто полагаться на assets ID.
-    # Для простоты: 'pub|<kind>|<target>|<payload_or_id>'
-    # Но лучше: сохранить метаданные в assets и передавать ID.
-    
     keyboard = [
         [
             InlineKeyboardButton("📱 Telegram", callback_data=f"p:tg"),
@@ -659,6 +678,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     target = data.split(":")[1]
+    target_names = {"tg": "Telegram", "x": "X.com", "both": "Везде"}
+    if target not in target_names:
+        await query.edit_message_text("❌ Неизвестное назначение публикации.")
+        return
     
     # Извлекаем сохраненные данные из user_data (потому что в callback_data не влезет всё)
     pending = context.user_data.get("pending_post")
@@ -677,7 +700,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем текущий размер очереди для отображения позиции
     total_size = await queue_size()
     
-    target_names = {"tg": "Telegram", "x": "X.com", "both": "Везде"}
     logger.info("Пост (%s) добавлен в очередь для %s", kind, target_names[target])
     await query.edit_message_text(
         f"✅ Добавлено в очередь! Назначение: {target_names[target]}\n"
@@ -736,61 +758,6 @@ async def h_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📹 Видео сохранено. Куда его опубликовать?", 
         reply_markup=_get_selection_keyboard("video", path, caption)
     )
-    # The original code had a return here, but it was removed in the diff.
-    # The original code also had an enqueue call after the _handle_media_group check.
-    # The diff replaces the enqueue with the new button logic.
-    # I will follow the diff and remove the original enqueue and reply_text.
-    # The _handle_media_group logic remains, and if it returns True, the function should exit.
-    # If _handle_media_group returns False, then the new button logic applies.
-    # Let's re-evaluate the h_video and h_photo structure based on the diff.
-
-    # Original h_video:
-    # if _handle_media_group(...):
-    #     await update.message.reply_text("Альбом обновлён, жду остальные кадры 📚")
-    #     return
-    # local_path = await save_media_locally(...)
-    # await enqueue(...)
-    # await update.message.reply_text("Видео добавлено в локальный архив и очередь 🎞️")
-
-    # Diff for h_video:
-    # logger.info("Получено видео от %s", _actor(update))
-    # video = update.message.video
-    # caption = update.message.caption or ""
-    # path = await save_media_locally(context.bot, video.file_id, "video")
-    # async with aiosqlite.connect(DB_PATH) as db:
-    #     await db.execute("INSERT INTO assets ...")
-    #     await db.commit()
-    # context.user_data["pending_post"] = {"kind": "video", "payload": path, "caption": caption}
-    # await update.message.reply_text("📹 Видео сохранено. Куда его опубликовать?", reply_markup=_get_selection_keyboard(...))
-
-    # The diff completely replaces the latter part of h_video.
-    # This means the _handle_media_group check is implicitly removed from the new h_video logic.
-    # This might be an oversight in the user's instruction, but I must follow the provided diff faithfully.
-    # The diff also removes the `return` statement that was after the `_handle_media_group` call.
-    # The instruction says "Обновить h_photo, h_video и _flush_album_buffer для использования кнопок."
-    # The provided diff for h_video does not include the _handle_media_group check.
-    # I will apply the diff as given.
-
-    # Re-reading the diff:
-    # The diff for h_video starts from `logger.info("Получено видео от %s", _actor(update))`.
-    # It then completely replaces the rest of the function.
-    # This means the `if _handle_media_group(...)` block is removed.
-    # This is a significant change, but I must follow the diff.
-
-    # The diff for h_photo also starts from `logger.info("Получено фото от %s", _actor(update))`.
-    # It also completely replaces the rest of the function, removing the `if _handle_media_group(...)` block.
-
-    # This implies that media group handling will no longer trigger the button selection,
-    # and single photos/videos will. This seems like a logical separation.
-    # The `_flush_album_buffer` is not in the diff, so I will not modify it.
-
-    # Final check on h_video diff:
-    # The diff ends with `await update.message.reply_text("📹 Видео сохранено. Куда его опубликовать?", reply_markup=_get_selection_keyboard("video", path, caption))`.
-    # The original code had `return` after `_handle_media_group` and then `await enqueue` and `await update.message.reply_text`.
-    # The diff replaces the `await enqueue` and `await update.message.reply_text` part.
-    # The `return` statement from the original code (after `_handle_media_group`) is not present in the diff.
-    # This means the `_handle_media_group` check is entirely gone from the new `h_video` and `h_photo` as per the diff.
-    # I will proceed with the diff as provided.
 
 # ---------------------- Publishing job ----------------------
 
@@ -805,6 +772,12 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info("Начинаем публикацию элемента #%s (%s), назначение=%s", item.id, item.kind, item.target)
+    if item.target not in ("tg", "x", "both"):
+        await requeue_item(item, target="both")
+        logger.error("Элемент #%s имеет неизвестную цель '%s' — возвращен как both", item.id, item.target)
+        return
+
+    telegram_published = False
     try:
         # --- Публикация в Telegram ---
         if item.target in ("tg", "both"):
@@ -870,40 +843,59 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
                 if not media_objects:
                     logger.warning("Все элементы альбома #%s отфильтрованы — пропуск", item.id)
                     return
-                await context.bot.send_media_group(chat_id=TARGET_CHAT, media=media_objects)
+                opened_files = []
+                try:
+                    for obj in media_objects:
+                        media_file = getattr(obj, "media", None)
+                        if media_file:
+                            opened_files.append(media_file)
+                    await context.bot.send_media_group(chat_id=TARGET_CHAT, media=media_objects)
+                finally:
+                    for media_file in opened_files:
+                        media_file.close()
+            telegram_published = True
         
         # --- Публикация в X ---
-        if item.target in ("x", "both") and x_publisher.X_ENABLED:
-            logger.info("Запуск параллельной публикации в X для элемента #%s", item.id)
-            asyncio.create_task(x_publisher.publish_to_x(
+        if item.target in ("x", "both"):
+            if not x_publisher.X_ENABLED:
+                raise RuntimeError("Публикация в X выбрана, но X_ENABLED=0")
+            logger.info("Запуск публикации в X для элемента #%s", item.id)
+            x_published = await x_publisher.publish_to_x(
                 context.bot, 
                 item.kind, 
                 item.payload, 
                 _apply_signature(item.caption)
-            ))
+            )
+            if not x_published:
+                raise RuntimeError("Публикация в X завершилась ошибкой")
         # ---------------------------
     except RetryAfter as e:
         # Telegram просит подождать e.retry_after секунд (Flood control)
         delay = int(getattr(e, "retry_after", 5)) + 1
-        await enqueue(item.kind, item.payload, item.caption)  # вернуть назад
+        retry_target = "x" if telegram_published and item.target == "both" else item.target
+        await requeue_item(item, target=retry_target)
         logger.warning(
-            "Публикацию #%s отложили из-за Flood control, повтор через %s сек",
+            "Публикацию #%s отложили из-за Flood control, повтор через %s сек, цель=%s",
             item.id,
             delay,
+            retry_target,
         )
         await asyncio.sleep(delay)
     except (TimedOut, NetworkError):
         # временный сбой сети: вернуть назад и позже повторить
-        await enqueue(item.kind, item.payload, item.caption)
+        retry_target = "x" if telegram_published and item.target == "both" else item.target
+        await requeue_item(item, target=retry_target)
         logger.warning(
-            "Сетевая ошибка при публикации #%s — повтор через 5 секунд",
+            "Сетевая ошибка при публикации #%s — повтор через 5 секунд, цель=%s",
             item.id,
+            retry_target,
         )
         await asyncio.sleep(5)
     except Exception:
         # непредвиденное: не теряем пост, возвращаем в хвост
-        await enqueue(item.kind, item.payload, item.caption)
-        logger.exception("Ошибка публикации элемента #%s", item.id)
+        retry_target = "x" if telegram_published and item.target == "both" else item.target
+        await requeue_item(item, target=retry_target)
+        logger.exception("Ошибка публикации элемента #%s, возвращен в очередь с целью=%s", item.id, retry_target)
     else:
         logger.info("Элемент #%s опубликован", item.id)
         if item.asset_id:

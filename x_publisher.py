@@ -75,6 +75,8 @@ async def publish_to_x(bot, kind: str, payload: str, caption: str = "") -> bool:
             media_id = _upload_media_by_path(api_v1, payload, kind)
             if media_id:
                 media_ids.append(media_id)
+            else:
+                return False
         elif kind == "album":
             text_to_post = caption
             try:
@@ -85,6 +87,10 @@ async def publish_to_x(bot, kind: str, payload: str, caption: str = "") -> bool:
                         media_ids.append(m_id)
             except Exception:
                 logger.error("Ошибка парсинга альбома для X")
+                return False
+            if not media_ids:
+                logger.error("Нет загруженных медиа для публикации альбома в X")
+                return False
 
         # Ограничение 280 символов
         if len(text_to_post) > 280:
