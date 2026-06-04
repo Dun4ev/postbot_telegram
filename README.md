@@ -23,9 +23,15 @@ python bot.py
 - `TG_BOT_TOKEN` — токен бота (обязательно).
 - `TG_CHANNEL` или `TG_CHANNEL_ID` — целевой канал.
 - `POSTBOT_STORAGE_DIR` — путь к папке хранения (дефолт: `storage`).
+- `POSTBOT_DB_PATH` — путь к SQLite-базе очереди (дефолт: `queue.db`; в Docker используется `/data/queue.db`).
 - `POSTBOT_ADMIN_ID` — Telegram ID администратора для получения ежедневных отчетов.
 - `POSTBOT_AUTO_SYNC` — включить автоматическое сканирование папки `storage` при старте (1 или 0).
-- `POSTBOT_SIGNATURE` — подпись, добавляемая к постам для X.com.
+- `POSTBOT_AI_CAPTION` — включить короткую AI-подпись для Telegram и X.com (1 или 0).
+- `POSTBOT_AI_ENDPOINT` — OpenAI-compatible endpoint генератора, например официальный Mistral API.
+- `POSTBOT_AI_API_KEY`, `POSTBOT_AI_MODEL`, `POSTBOT_AI_LANGUAGE`, `POSTBOT_AI_STYLE`, `POSTBOT_AI_TIMEOUT`, `POSTBOT_AI_MAX_CHARS` — параметры AI-генерации.
+- `POSTBOT_FILL_CAPTIONS_LIMIT` — размер порции для ручного заполнения старых подписей командой `/fill_captions` (дефолт: 10).
+- `POSTBOT_FILL_CAPTIONS_DELAY` — пауза между AI-запросами при заполнении старой базы, чтобы не упереться в rate limit (дефолт: 60 секунд).
+- `POSTBOT_FILL_CAPTIONS_RATE_LIMIT_SLEEP` — пауза фонового заполнения после ответа `429 Too Many Requests` (дефолт: 1800 секунд).
 - `TZ` — часовой пояс (по умолчанию `Europe/Belgrade`).
 - `POST_SLOTS` — список времён публикации (формат `HH:MM,HH:MM`).
 - `X_ENABLED` — включить публикацию в X (1 или 0).
@@ -44,14 +50,28 @@ python bot.py
 
 Если пост выбран для публикации **Везде**, а Telegram уже опубликован, но X.com вернул ошибку, бот возвращает в очередь только X.com-часть. Это защищает канал Telegram от дублей и не теряет неудачную X-публикацию.
 
-Состояние очереди можно посмотреть командой `/queue`, публикация следующего поста сейчас — `/now`, пополнение из архива — `/restock`.
+Можно включить короткую AI-подпись для Telegram и X.com:
+```env
+POSTBOT_AI_CAPTION=1
+POSTBOT_AI_ENDPOINT=https://api.mistral.ai/v1/chat/completions
+POSTBOT_AI_API_KEY=your-mistral-api-key
+POSTBOT_AI_MODEL=magistral-small-2509
+POSTBOT_AI_LANGUAGE=English
+POSTBOT_AI_STYLE=Short intriguing captions for a private lifestyle channel of a confident beautiful girl. Positive flirtation, light mystery, warmth, and an invitation to chat. Add 1-3 soft emojis like smiles, hearts, sparkles, or peach. No explicit promises, links, or hashtags.
+POSTBOT_AI_MAX_CHARS=120
+```
+Бот отправляет генератору исходную подпись/текст как контекст через Mistral Chat Completions API, просит одну простую строку без ссылок и хэштегов, сохраняет ее в очередь и использует одинаково в Telegram и X.com. Если генератор недоступен или не ответил за `POSTBOT_AI_TIMEOUT`, публикация идет со старой подписью/текстом.
+
+Для старой базы можно дозаполнить подписи вручную: `/fill_captions` обработает небольшую порцию старых записей без `ai_caption`, а `/fill_captions 25` обработает до 25 записей. Команда сначала заполняет текущую очередь, потом оставшийся архив; обновляет `assets.ai_caption`, связанные записи `queue.ai_caption`, а если у медиа вообще не было подписи, кладет тот же текст в `caption` для Telegram. Перед массовым запуском сделайте бэкап `queue.db`. Для бесплатного Mistral начинайте с `POSTBOT_FILL_CAPTIONS_DELAY=60`; если Mistral отвечает `429 Too Many Requests`, команда остановит текущую порцию, а следующий запуск стоит делать позже или с большей паузой.
+
+Состояние очереди можно посмотреть командой `/queue`, публикация следующего поста сейчас — `/now`, пополнение из архива — `/restock`, заполнение старых подписей — `/fill_captions`.
 еще добавлено автоматическое меню команд для удобства.
 
 ## Запуск через Docker Compose
 ```bash
 docker-compose up --build
 ```
-Файл `docker-compose.yml` устанавливает зависимости и монтирует каталог проекта в `/app`, а медиаархив — в `/app/storage`.
+Файл `docker-compose.yml` устанавливает зависимости, монтирует код проекта в `/app`, а базу и медиаархив держит в Docker volumes. Это важно для локального запуска из облачной папки: SQLite, логи и медиа не должны читаться/писаться через SynologyDrive mount.
 
 ## Разработка и проверки
 Перед коммитом прогоните:

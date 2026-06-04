@@ -69,7 +69,7 @@ async def publish_to_x(bot, kind: str, payload: str, caption: str = "") -> bool:
         media_ids = []
 
         if kind == "text":
-            text_to_post = payload
+            text_to_post = caption or payload
         elif kind in ("photo", "video"):
             text_to_post = caption
             media_id = _upload_media_by_path(api_v1, payload, kind)

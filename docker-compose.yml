@@ -5,16 +5,34 @@ services:
     working_dir: /app
     env_file:
       - .env
+    environment:
+      POSTBOT_DB_PATH: /data/queue.db
+      POSTBOT_STORAGE_DIR: /app/storage
+      POSTBOT_LOG_FILE: ""
+      POSTBOT_AUTO_SYNC: "0"
+      POSTBOT_FILL_CAPTIONS_DELAY: "60"
+      POSTBOT_FILL_CAPTIONS_RATE_LIMIT_SLEEP: "1800"
+      POST_SLOTS: ""
+      X_ENABLED: "0"
     command: >
       bash -lc
-      "pip install --no-cache-dir -r requirements.txt
+      "if [ ! -f /data/queue.db ]; then cp /seed/queue.db /data/queue.db; fi
+      && if [ -z \"$$(find /app/storage -mindepth 1 -maxdepth 1 -print -quit)\" ]; then cp -a /seed_storage/. /app/storage/; fi
+      && pip install --no-cache-dir -r requirements.txt
       && python bot.py"
     volumes:
-      - /volume1/docker/postbot/repo:/app
-      - /volume1/docker/postbot/storage:/app/storage
+      - .:/app
+      - ./queue.db:/seed/queue.db:ro
+      - ./storage:/seed_storage:ro
+      - postbot_data:/data
+      - postbot_storage:/app/storage
     restart: unless-stopped
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  postbot_data:
+  postbot_storage:

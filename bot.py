@@ -17,6 +17,10 @@ import os
 import json
 import asyncio
 import logging
+import re
+import zlib
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import time as dtime, datetime
 from typing import Optional, List
@@ -107,6 +111,8 @@ def setup_logging() -> None:
         handlers.append(file_handler)
 
     logging.basicConfig(level=level, handlers=handlers, force=True)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     logger.info(
         "Логирование настроено: уровень=%s, файл=%s, handlers=%d",
         logging.getLevelName(level),
@@ -153,13 +159,216 @@ def _parse_slots_from_env() -> List[dtime]:
         raise SystemExit("Set POST_SLOTS in HH:MM,HH:MM format") from exc
     return slots
 
-POSTBOT_SIGNATURE = os.getenv("POSTBOT_SIGNATURE", "")
+AI_CAPTION_ENABLED = (
+    os.getenv("POSTBOT_AI_CAPTION", os.getenv("POSTBOT_X_AI_CAPTION", "0")) == "1"
+)
+AI_ENDPOINT = os.getenv("POSTBOT_AI_ENDPOINT", os.getenv("POSTBOT_X_AI_ENDPOINT", "")).strip()
+AI_API_KEY = os.getenv("POSTBOT_AI_API_KEY", os.getenv("POSTBOT_X_AI_API_KEY", "")).strip()
+AI_MODEL = os.getenv("POSTBOT_AI_MODEL", os.getenv("POSTBOT_X_AI_MODEL", "mistral-small-latest")).strip()
+AI_LANGUAGE = os.getenv("POSTBOT_AI_LANGUAGE", os.getenv("POSTBOT_X_AI_LANGUAGE", "English")).strip()
+AI_STYLE = os.getenv(
+    "POSTBOT_AI_STYLE",
+    (
+        "Short intriguing captions for a private lifestyle channel of a confident beautiful girl. "
+        "Use positive flirtation, warmth, and light mystery. "
+        "Add 1-3 soft emojis such as smiles, hearts, sparkles, or peach, but keep it tasteful. "
+        "Phrases can feel like: 'what do you think?', 'do you like this pose?', "
+        "'come chat with me', 'write me'."
+    ),
+).strip()
+AI_TIMEOUT = float(os.getenv("POSTBOT_AI_TIMEOUT", os.getenv("POSTBOT_X_AI_TIMEOUT", "8")))
+AI_MAX_CHARS = _safe_int_env("POSTBOT_AI_MAX_CHARS", _safe_int_env("POSTBOT_X_AI_MAX_CHARS", 180))
+X_POST_LIMIT = 280
+X_URL_LENGTH = 23
+URL_RE = re.compile(r"https?://\S+")
+QUOTED_TEXT_RE = re.compile(r"[\"“”']([^\"“”']{3,180})[\"“”']")
+FALLBACK_CAPTIONS = [
+    "What do you think? 💕",
+    "Do you like this vibe? 😉",
+    "A little mystery for you ✨",
+    "Come chat with me 💋",
+    "Write me something sweet 💕",
+    "Just a little tease 🍑",
+    "Feeling cute today 😉",
+    "Is this your favorite one? 💫",
+    "Tell me if you like it 💕",
+    "A soft little moment ✨",
+]
 
-def _apply_signature(caption: str) -> str:
-    """Добавляет глобальную подпись к тексту."""
-    if not POSTBOT_SIGNATURE:
-        return caption
-    return f"{caption}{POSTBOT_SIGNATURE}".strip()
+
+class AIRateLimitError(RuntimeError):
+    """AI API вернул rate limit, продолжать текущую порцию не нужно."""
+
+
+def _x_weighted_length(text: str) -> int:
+    """
+    Приближенно считает длину X-поста: URL занимают 23 символа.
+    Эмодзи и редкие Unicode-символы считаем с небольшим запасом.
+    """
+    total = len(text)
+    for url in URL_RE.findall(text):
+        total += X_URL_LENGTH - len(url)
+    total += sum(1 for char in text if ord(char) > 0xFFFF)
+    return total
+
+
+def _trim_to_x_limit(text: str, limit: int = X_POST_LIMIT) -> str:
+    """
+    Обрезает текст до лимита X без разрыва URL-правила точным алгоритмом.
+    """
+    text = (text or "").strip()
+    if _x_weighted_length(text) <= limit:
+        return text
+
+    ellipsis = "..."
+    trimmed = text
+    while trimmed and _x_weighted_length(f"{trimmed}{ellipsis}") > limit:
+        trimmed = trimmed[:-1].rstrip()
+    return f"{trimmed}{ellipsis}" if trimmed else ""
+
+
+def _sanitize_ai_caption(text: str) -> str:
+    """
+    Чистит короткую AI-подпись от кавычек, ссылок и лишних переносов.
+    """
+    if isinstance(text, list):
+        parts = []
+        for part in text:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or ""))
+            else:
+                parts.append(str(part))
+        text = " ".join(parts)
+    elif not isinstance(text, str):
+        text = str(text or "")
+
+    text = (text or "").strip().strip('"').strip("'")
+    text = URL_RE.sub("", text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " ".join(lines)
+
+
+def _extract_ai_content(message: object) -> str:
+    """
+    Достает финальный текст из OpenAI-compatible ответа.
+    У некоторых локальных reasoning-моделей LM Studio content пустой,
+    а варианты лежат в reasoning_content.
+    """
+    if not isinstance(message, dict):
+        return ""
+
+    content = message.get("content")
+    if content:
+        return content
+
+    reasoning = message.get("reasoning_content")
+    if not isinstance(reasoning, str):
+        return ""
+
+    candidates = [
+        match.strip()
+        for match in QUOTED_TEXT_RE.findall(reasoning)
+        if 3 <= len(match.strip()) <= AI_MAX_CHARS
+    ]
+    return candidates[-1] if candidates else ""
+
+
+def _fallback_caption(seed: str) -> str:
+    """
+    Детерминированная короткая подпись, если локальная модель вернула пустой текст.
+    """
+    index = zlib.crc32((seed or "").encode("utf-8")) % len(FALLBACK_CAPTIONS)
+    return FALLBACK_CAPTIONS[index]
+
+
+def _request_ai_caption_sync(source_text: str, max_chars: int) -> Optional[str]:
+    """
+    Запрашивает короткий X-текст у OpenAI-compatible chat completions endpoint.
+    """
+    if not AI_ENDPOINT:
+        logger.warning("POSTBOT_AI_CAPTION=1, но POSTBOT_AI_ENDPOINT не задан")
+        return None
+
+    source_text = (source_text or "").strip()
+    prompt = (
+        f"Write one simple, natural social media caption in {AI_LANGUAGE}. "
+        f"Style: {AI_STYLE}. "
+        f"Maximum {max_chars} characters. No links. No hashtags. "
+        "Use 1-3 fitting emojis. "
+        "No explicit promises. No explicit sexual content. "
+        "Do not invent facts. Keep it positive, flirty, intriguing, and human. "
+        "Return only the caption text."
+    )
+    user_text = source_text or "Create a short neutral teaser for a media post."
+    request_body = {
+        "model": AI_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_text[:1000]},
+        ],
+        "temperature": 0.8,
+        "max_tokens": 80,
+    }
+    headers = {"Content-Type": "application/json"}
+    if AI_API_KEY:
+        headers["Authorization"] = f"Bearer {AI_API_KEY}"
+
+    request = urllib.request.Request(
+        AI_ENDPOINT,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=AI_TIMEOUT) as response:
+            response_body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise AIRateLimitError("AI API вернул 429 Too Many Requests") from exc
+        logger.warning("AI-подпись не получена: %s", exc)
+        return None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("AI-подпись не получена: %s", exc)
+        return None
+
+    try:
+        message = response_body["choices"][0]["message"]
+        content = _extract_ai_content(message)
+    except (KeyError, IndexError, TypeError):
+        logger.warning("AI-подпись пришла в неизвестном формате")
+        return None
+
+    caption = _sanitize_ai_caption(content)
+    return _trim_to_x_limit(caption, max_chars) if caption else None
+
+
+async def build_ai_caption_for_post(kind: str, payload: str, caption: str = "") -> str:
+    """
+    Готовит единую подпись поста для Telegram и X.
+    """
+    source_text = payload if kind == "text" else caption
+    ai_limit = min(AI_MAX_CHARS, X_POST_LIMIT)
+
+    generated_caption = source_text or ""
+    if AI_CAPTION_ENABLED:
+        generated = await asyncio.to_thread(_request_ai_caption_sync, source_text, ai_limit)
+        if generated:
+            generated_caption = generated
+
+    if not generated_caption and kind != "text":
+        generated_caption = _fallback_caption(payload)
+
+    return _trim_to_x_limit(generated_caption)
+
+
+async def build_ai_caption(item: "QueueItem") -> str:
+    """
+    Возвращает сохраненную AI-подпись или обычный текст старого элемента.
+    """
+    if item.ai_caption:
+        return _trim_to_x_limit(item.ai_caption)
+    source_text = item.payload if item.kind == "text" else item.caption
+    return _trim_to_x_limit(source_text)
 
 DAILY_SLOTS = _parse_slots_from_env()
 logger.info(
@@ -167,11 +376,14 @@ logger.info(
     ", ".join(slot.strftime("%H:%M") for slot in DAILY_SLOTS),
 )
 
-DB_PATH = "queue.db"
+DB_PATH = os.getenv("POSTBOT_DB_PATH", "queue.db")
 STORAGE_DIR = os.getenv("POSTBOT_STORAGE_DIR", "storage")
 ADMIN_ID_RAW = os.getenv("POSTBOT_ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW and ADMIN_ID_RAW.isdigit() else None
 AUTO_SYNC = os.getenv("POSTBOT_AUTO_SYNC", "1") == "1"
+FILL_CAPTIONS_LIMIT = _safe_int_env("POSTBOT_FILL_CAPTIONS_LIMIT", 10)
+FILL_CAPTIONS_DELAY = float(os.getenv("POSTBOT_FILL_CAPTIONS_DELAY", "2"))
+FILL_CAPTIONS_RATE_LIMIT_SLEEP = _safe_int_env("POSTBOT_FILL_CAPTIONS_RATE_LIMIT_SLEEP", 1800)
 
 logger.info("Файл очереди: %s, Директория хранения: %s", DB_PATH, STORAGE_DIR)
 if ADMIN_ID:
@@ -187,6 +399,7 @@ class QueueItem:
     payload: str     # text or LOCAL PATH (or JSON for album)
     caption: str     # optional
     target: str      # 'tg' | 'x' | 'both'
+    ai_caption: str = ""
     asset_id: Optional[int] = None
 
 CREATE_SQL = """
@@ -196,6 +409,7 @@ CREATE TABLE IF NOT EXISTS queue (
   payload  TEXT    NOT NULL,
   caption  TEXT    NOT NULL DEFAULT '',
   target   TEXT    NOT NULL DEFAULT 'both',
+  ai_caption TEXT   NOT NULL DEFAULT '',
   asset_id INTEGER,
   created  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
@@ -205,6 +419,7 @@ CREATE TABLE IF NOT EXISTS assets (
   path         TEXT    NOT NULL,
   kind         TEXT    NOT NULL,
   caption      TEXT    NOT NULL DEFAULT '',
+  ai_caption    TEXT    NOT NULL DEFAULT '',
   source       TEXT    NOT NULL DEFAULT 'direct',
   is_published INTEGER NOT NULL DEFAULT 0,
   created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
@@ -241,8 +456,20 @@ async def db_init() -> None:
             pass
 
         try:
+            await db.execute("ALTER TABLE queue ADD COLUMN ai_caption TEXT NOT NULL DEFAULT ''")
+            logger.info("База данных обновлена: добавлена колонка 'ai_caption' в queue")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
             await db.execute("ALTER TABLE assets ADD COLUMN is_published INTEGER NOT NULL DEFAULT 0")
             logger.info("База данных обновлена: добавлена колонка 'is_published' в assets")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE assets ADD COLUMN ai_caption TEXT NOT NULL DEFAULT ''")
+            logger.info("База данных обновлена: добавлена колонка 'ai_caption' в assets")
         except sqlite3.OperationalError:
             pass
 
@@ -272,15 +499,22 @@ async def save_media_locally(bot, file_id: str, kind: str) -> str:
     logger.info("Файл сохранен локально: %s", rel_path)
     return rel_path
 
-async def enqueue(kind: str, payload: str, caption: str = "", target: str = "both", asset_id: Optional[int] = None) -> None:
+async def enqueue(
+    kind: str,
+    payload: str,
+    caption: str = "",
+    target: str = "both",
+    asset_id: Optional[int] = None,
+    ai_caption: str = "",
+) -> None:
     logger.info(
-        "Элемент добавлен в очередь: тип=%s, цель=%s, asset_id=%s, длина_данных=%d",
-        kind, target, asset_id, len(payload or "")
+        "Элемент добавлен в очередь: тип=%s, цель=%s, asset_id=%s, длина_данных=%d, ai_caption=%s",
+        kind, target, asset_id, len(payload or ""), bool(ai_caption)
     )
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO queue (kind, payload, caption, target, asset_id) VALUES (?, ?, ?, ?, ?)",
-            (kind, payload, caption or "", target, asset_id)
+            "INSERT INTO queue (kind, payload, caption, target, asset_id, ai_caption) VALUES (?, ?, ?, ?, ?, ?)",
+            (kind, payload, caption or "", target, asset_id, ai_caption or "")
         )
         await db.commit()
 
@@ -295,6 +529,7 @@ async def requeue_item(item: QueueItem, target: Optional[str] = None) -> None:
         item.caption,
         target=target or item.target,
         asset_id=item.asset_id,
+        ai_caption=item.ai_caption,
     )
 
 
@@ -362,7 +597,22 @@ async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         # Если chat_id почему-то нет, просто в очередь (fallback)
-        await enqueue("album", payload, caption, target="both")
+        ai_caption = await build_ai_caption_for_post("album", payload, caption)
+        await enqueue(
+            "album",
+            payload,
+            ai_caption or caption,
+            target="both",
+            asset_id=asset_id,
+            ai_caption=ai_caption,
+        )
+        if ai_caption:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE assets SET ai_caption = ? WHERE id = ?",
+                    (ai_caption, asset_id),
+                )
+                await db.commit()
     logger.info(
         "Альбом media_group_id=%s отправлен в очередь (%d элементов)",
         media_group_id,
@@ -411,7 +661,7 @@ def _handle_media_group(
 async def dequeue() -> Optional[QueueItem]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, kind, payload, caption, target, asset_id FROM queue ORDER BY id LIMIT 1"
+            "SELECT id, kind, payload, caption, target, ai_caption, asset_id FROM queue ORDER BY id LIMIT 1"
         ) as cursor:
             row = await cursor.fetchone()
             if row:
@@ -425,7 +675,7 @@ async def dequeue() -> Optional[QueueItem]:
 async def peek_many(n: int = 10) -> List[QueueItem]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, kind, payload, caption, target, asset_id FROM queue ORDER BY id ASC LIMIT ?",
+            "SELECT id, kind, payload, caption, target, ai_caption, asset_id FROM queue ORDER BY id ASC LIMIT ?",
             (n,)
         )
         rows = await cur.fetchall()
@@ -524,6 +774,151 @@ def _actor(update: Update) -> str:
         return f"id={user.id}"
     return "unknown"
 
+
+def _is_admin(update: Update) -> bool:
+    """
+    Проверяет доступ к административным командам, если POSTBOT_ADMIN_ID задан.
+    """
+    if not ADMIN_ID:
+        return True
+    user = update.effective_user
+    return bool(user and user.id == ADMIN_ID)
+
+
+async def fill_missing_captions(limit: int, shard_index: int = 0, shard_total: int = 1) -> dict:
+    """
+    Заполняет пустые AI-подписи в архиве и очереди небольшой порцией.
+    """
+    if shard_total < 1:
+        shard_total = 1
+    shard_index = max(0, min(shard_index, shard_total - 1))
+
+    stats = {
+        "assets_filled": 0,
+        "queue_filled": 0,
+        "skipped": 0,
+        "errors": 0,
+        "rate_limited": 0,
+    }
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT q.id, q.kind, q.payload, q.caption, q.asset_id
+            FROM queue q
+            WHERE COALESCE(q.ai_caption, '') = ''
+              AND q.kind IN ('photo', 'video', 'album')
+              AND (? = 1 OR (q.id % ?) = ?)
+            ORDER BY q.id ASC
+            LIMIT ?
+            """,
+            (shard_total, shard_total, shard_index, limit),
+        ) as cursor:
+            queue_rows = await cursor.fetchall()
+
+        for queue_id, kind, payload, caption, asset_id in queue_rows:
+            try:
+                ai_caption = await build_ai_caption_for_post(kind, payload, caption or "")
+            except AIRateLimitError as exc:
+                stats["rate_limited"] = 1
+                logger.warning("Заполнение подписей остановлено из-за rate limit: %s", exc)
+                break
+            except Exception as exc:
+                stats["errors"] += 1
+                logger.warning("Не удалось создать подпись для queue #%s: %s", queue_id, exc)
+                continue
+
+            if not ai_caption:
+                stats["skipped"] += 1
+                continue
+
+            await db.execute(
+                """
+                UPDATE queue
+                SET ai_caption = ?,
+                    caption = CASE WHEN COALESCE(caption, '') = '' THEN ? ELSE caption END
+                WHERE id = ?
+                """,
+                (ai_caption, ai_caption, queue_id),
+            )
+            stats["queue_filled"] += 1
+
+            if asset_id:
+                await db.execute(
+                    """
+                    UPDATE assets
+                    SET ai_caption = ?,
+                        caption = CASE WHEN COALESCE(caption, '') = '' THEN ? ELSE caption END
+                    WHERE id = ?
+                      AND COALESCE(ai_caption, '') = ''
+                    """,
+                    (ai_caption, ai_caption, asset_id),
+                )
+            await db.commit()
+            await asyncio.sleep(FILL_CAPTIONS_DELAY)
+
+        remaining = max(limit - stats["queue_filled"], 0)
+        if not remaining:
+            await db.commit()
+            return stats
+
+        async with db.execute(
+            """
+            SELECT id, path, kind, caption
+            FROM assets
+            WHERE COALESCE(ai_caption, '') = ''
+              AND kind IN ('photo', 'video', 'album')
+              AND (? = 1 OR (id % ?) = ?)
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (shard_total, shard_total, shard_index, remaining),
+        ) as cursor:
+            asset_rows = await cursor.fetchall()
+
+        for asset_id, path, kind, caption in asset_rows:
+            try:
+                ai_caption = await build_ai_caption_for_post(kind, path, caption or "")
+            except AIRateLimitError as exc:
+                stats["rate_limited"] = 1
+                logger.warning("Заполнение подписей остановлено из-за rate limit: %s", exc)
+                break
+            except Exception as exc:
+                stats["errors"] += 1
+                logger.warning("Не удалось создать подпись для asset #%s: %s", asset_id, exc)
+                continue
+
+            if not ai_caption:
+                stats["skipped"] += 1
+                continue
+
+            await db.execute(
+                """
+                UPDATE assets
+                SET ai_caption = ?,
+                    caption = CASE WHEN COALESCE(caption, '') = '' THEN ? ELSE caption END
+                WHERE id = ?
+                """,
+                (ai_caption, ai_caption, asset_id),
+            )
+            await db.execute(
+                """
+                UPDATE queue
+                SET ai_caption = ?,
+                    caption = CASE WHEN COALESCE(caption, '') = '' THEN ? ELSE caption END
+                WHERE asset_id = ?
+                  AND COALESCE(ai_caption, '') = ''
+                """,
+                (ai_caption, ai_caption, asset_id),
+            )
+            stats["assets_filled"] += 1
+            await db.commit()
+            await asyncio.sleep(FILL_CAPTIONS_DELAY)
+
+        await db.commit()
+
+    return stats
+
 # ---------------------- Handlers ----------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -617,7 +1012,7 @@ async def cmd_restock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with aiosqlite.connect(DB_PATH) as db:
             # Берем только то, что еще не опубликовано и не в очереди
             query = """
-                SELECT id, path, kind, caption 
+                SELECT id, path, kind, caption, ai_caption
                 FROM assets 
                 WHERE is_published = 0 
                   AND id NOT IN (SELECT asset_id FROM queue WHERE asset_id IS NOT NULL)
@@ -631,14 +1026,64 @@ async def cmd_restock(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Нет новых материалов для добавления в очередь.")
                 return
 
-            for a_id, path, kind, caption in rows:
-                await enqueue(kind, path, caption, target="both", asset_id=a_id)
+            for a_id, path, kind, caption, ai_caption in rows:
+                queue_caption = ai_caption or caption
+                await enqueue(
+                    kind,
+                    path,
+                    queue_caption,
+                    target="both",
+                    asset_id=a_id,
+                    ai_caption=ai_caption,
+                )
             await db.commit()
         
         await update.message.reply_text(f"✅ Очередь успешно пополнена: добавлено {len(rows)} новых постов.")
     except Exception as e:
         logger.exception("Ошибка в cmd_restock: %s", e)
         await update.message.reply_text("⚠️ Ошибка при пополнении очереди.")
+
+
+async def cmd_fill_captions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Дозаполняет AI-подписи для старых элементов архива и очереди.
+    Использование: /fill_captions [количество]
+    """
+    if not _is_admin(update):
+        logger.warning("Команда /fill_captions отклонена для %s", _actor(update))
+        await update.message.reply_text("⛔️ Команда доступна только администратору.")
+        return
+
+    if not AI_CAPTION_ENABLED or not AI_ENDPOINT:
+        await update.message.reply_text(
+            "AI-подписи выключены. Проверь POSTBOT_AI_CAPTION=1 и POSTBOT_AI_ENDPOINT."
+        )
+        return
+
+    args = context.args
+    limit = FILL_CAPTIONS_LIMIT
+    if args and args[0].isdigit():
+        limit = int(args[0])
+    limit = min(max(limit, 1), 50)
+
+    logger.info("Команда /fill_captions от %s, limit=%d", _actor(update), limit)
+    await update.message.reply_text(f"Заполняю подписи, максимум {limit} шт...")
+
+    try:
+        stats = await fill_missing_captions(limit)
+    except Exception as e:
+        logger.exception("Ошибка в cmd_fill_captions: %s", e)
+        await update.message.reply_text("⚠️ Ошибка при заполнении подписей.")
+        return
+
+    await update.message.reply_text(
+        "Готово.\n"
+        f"Архив: +{stats['assets_filled']}\n"
+        f"Очередь без архива: +{stats['queue_filled']}\n"
+        f"Пропущено: {stats['skipped']}\n"
+        f"Ошибок: {stats['errors']}\n"
+        f"Rate limit: {'да' if stats.get('rate_limited') else 'нет'}"
+    )
 
 async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -693,8 +1138,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payload = pending["payload"]
     caption = pending["caption"]
     asset_id = pending.get("asset_id")
+
+    ai_caption = await build_ai_caption_for_post(kind, payload, caption)
+    if kind == "text":
+        payload = ai_caption or payload
+        caption = ""
+    elif ai_caption:
+        caption = ai_caption
     
-    await enqueue(kind, payload, caption, target, asset_id)
+    await enqueue(kind, payload, caption, target, asset_id, ai_caption=ai_caption)
+    if asset_id and ai_caption:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE assets SET ai_caption = ? WHERE id = ?",
+                (ai_caption, asset_id),
+            )
+            await db.commit()
     context.user_data.pop("pending_post", None)
     
     # Получаем текущий размер очереди для отображения позиции
@@ -860,11 +1319,12 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
             if not x_publisher.X_ENABLED:
                 raise RuntimeError("Публикация в X выбрана, но X_ENABLED=0")
             logger.info("Запуск публикации в X для элемента #%s", item.id)
+            ai_caption = await build_ai_caption(item)
             x_published = await x_publisher.publish_to_x(
                 context.bot, 
                 item.kind, 
                 item.payload, 
-                _apply_signature(item.caption)
+                ai_caption
             )
             if not x_published:
                 raise RuntimeError("Публикация в X завершилась ошибкой")
@@ -947,6 +1407,7 @@ async def post_init(application: Application) -> None:
         BotCommand("queue", "Посмотреть очередь"),
         BotCommand("now", "Опубликовать следующий пост сейчас"),
         BotCommand("restock", "Пополнить очередь из архива"),
+        BotCommand("fill_captions", "Заполнить старые AI-подписи"),
         BotCommand("health", "Статус бота и слотов"),
     ]
     await application.bot.set_my_commands(commands)
@@ -972,6 +1433,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("now", cmd_publish_now))
     app.add_handler(CommandHandler("publish_now", cmd_publish_now))
     app.add_handler(CommandHandler("restock", cmd_restock))
+    app.add_handler(CommandHandler("fill_captions", cmd_fill_captions))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     # контент
