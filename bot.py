@@ -54,6 +54,7 @@ from dotenv import load_dotenv, find_dotenv  # NEW
 load_dotenv(find_dotenv())                   # NEW: подхватить .env из текущей папки
 
 import x_publisher  # NEW: интеграция с X
+from x_publisher import x_weighted_length, trim_to_x_limit, X_POST_LIMIT, URL_RE
 # если .env лежит не рядом со скриптом:
 # load_dotenv("/полный/путь/к/.env")
 
@@ -178,9 +179,6 @@ AI_STYLE = os.getenv(
 ).strip()
 AI_TIMEOUT = float(os.getenv("POSTBOT_AI_TIMEOUT", os.getenv("POSTBOT_X_AI_TIMEOUT", "8")))
 AI_MAX_CHARS = _safe_int_env("POSTBOT_AI_MAX_CHARS", _safe_int_env("POSTBOT_X_AI_MAX_CHARS", 180))
-X_POST_LIMIT = 280
-X_URL_LENGTH = 23
-URL_RE = re.compile(r"https?://\S+")
 QUOTED_TEXT_RE = re.compile(r"[\"“”']([^\"“”']{3,180})[\"“”']")
 FALLBACK_CAPTIONS = [
     "What do you think? 💕",
@@ -200,31 +198,24 @@ class AIRateLimitError(RuntimeError):
     """AI API вернул rate limit, продолжать текущую порцию не нужно."""
 
 
-def _x_weighted_length(text: str) -> int:
-    """
-    Приближенно считает длину X-поста: URL занимают 23 символа.
-    Эмодзи и редкие Unicode-символы считаем с небольшим запасом.
-    """
-    total = len(text)
-    for url in URL_RE.findall(text):
-        total += X_URL_LENGTH - len(url)
-    total += sum(1 for char in text if ord(char) > 0xFFFF)
-    return total
+POSTBOT_SIGNATURE = os.getenv("POSTBOT_SIGNATURE", "").replace(r"\n", "\n")
 
-
-def _trim_to_x_limit(text: str, limit: int = X_POST_LIMIT) -> str:
+def _apply_x_signature(caption: str) -> str:
     """
-    Обрезает текст до лимита X без разрыва URL-правила точным алгоритмом.
+    Добавляет POSTBOT_SIGNATURE к подписи для X.com,
+    предварительно обрезая подпись так, чтобы всё вместе уместилось в 280 символов.
     """
-    text = (text or "").strip()
-    if _x_weighted_length(text) <= limit:
-        return text
+    caption = (caption or "").strip()
+    if not POSTBOT_SIGNATURE:
+        return trim_to_x_limit(caption)
 
-    ellipsis = "..."
-    trimmed = text
-    while trimmed and _x_weighted_length(f"{trimmed}{ellipsis}") > limit:
-        trimmed = trimmed[:-1].rstrip()
-    return f"{trimmed}{ellipsis}" if trimmed else ""
+    sig_len = x_weighted_length(POSTBOT_SIGNATURE)
+    allowed_caption_len = max(0, X_POST_LIMIT - sig_len)
+    
+    trimmed_caption = trim_to_x_limit(caption, allowed_caption_len)
+    if trimmed_caption:
+        return f"{trimmed_caption}{POSTBOT_SIGNATURE}"
+    return POSTBOT_SIGNATURE
 
 
 def _sanitize_ai_caption(text: str) -> str:
@@ -339,7 +330,7 @@ def _request_ai_caption_sync(source_text: str, max_chars: int) -> Optional[str]:
         return None
 
     caption = _sanitize_ai_caption(content)
-    return _trim_to_x_limit(caption, max_chars) if caption else None
+    return trim_to_x_limit(caption, max_chars) if caption else None
 
 
 async def build_ai_caption_for_post(kind: str, payload: str, caption: str = "") -> str:
@@ -358,17 +349,18 @@ async def build_ai_caption_for_post(kind: str, payload: str, caption: str = "") 
     if not generated_caption and kind != "text":
         generated_caption = _fallback_caption(payload)
 
-    return _trim_to_x_limit(generated_caption)
+    return trim_to_x_limit(generated_caption)
 
 
 async def build_ai_caption(item: "QueueItem") -> str:
     """
-    Возвращает сохраненную AI-подпись или обычный текст старого элемента.
+    Возвращает сохраненную AI-подпись или обычный текст старого элемента,
+    с добавлением глобальной подписи для X.com.
     """
     if item.ai_caption:
-        return _trim_to_x_limit(item.ai_caption)
+        return _apply_x_signature(item.ai_caption)
     source_text = item.payload if item.kind == "text" else item.caption
-    return _trim_to_x_limit(source_text)
+    return _apply_x_signature(source_text)
 
 DAILY_SLOTS = _parse_slots_from_env()
 logger.info(

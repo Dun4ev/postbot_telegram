@@ -8,9 +8,39 @@ import os
 import logging
 import json
 import tweepy
+import re
 from typing import Optional, List
 
 logger = logging.getLogger("postbot.x_publisher")
+
+X_POST_LIMIT = 280
+X_URL_LENGTH = 23
+URL_RE = re.compile(r"https?://\S+")
+
+def x_weighted_length(text: str) -> int:
+    """
+    Приближенно считает длину X-поста: URL занимают 23 символа.
+    Эмодзи и редкие Unicode-символы считаем с небольшим запасом.
+    """
+    total = len(text)
+    for url in URL_RE.findall(text):
+        total += X_URL_LENGTH - len(url)
+    total += sum(1 for char in text if ord(char) > 0xFFFF)
+    return total
+
+def trim_to_x_limit(text: str, limit: int = X_POST_LIMIT) -> str:
+    """
+    Обрезает текст до лимита X без разрыва URL-правила точным алгоритмом.
+    """
+    text = (text or "").strip()
+    if x_weighted_length(text) <= limit:
+        return text
+
+    ellipsis = "..."
+    trimmed = text
+    while trimmed and x_weighted_length(f"{trimmed}{ellipsis}") > limit:
+        trimmed = trimmed[:-1].rstrip()
+    return f"{trimmed}{ellipsis}" if trimmed else ""
 
 # Настройки из .env через os.getenv (подгружаются в bot.py)
 X_ENABLED = os.getenv("X_ENABLED", "0") == "1"
@@ -92,9 +122,8 @@ async def publish_to_x(bot, kind: str, payload: str, caption: str = "") -> bool:
                 logger.error("Нет загруженных медиа для публикации альбома в X")
                 return False
 
-        # Ограничение 280 символов
-        if len(text_to_post) > 280:
-            text_to_post = text_to_post[:277] + "..."
+        # Ограничение 280 символов с учетом URL и эмодзи
+        text_to_post = trim_to_x_limit(text_to_post)
 
         # Публикация
         response = client_v2.create_tweet(
