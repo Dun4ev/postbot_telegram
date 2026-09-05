@@ -135,10 +135,15 @@ CHANNEL = os.getenv("TG_CHANNEL")  # e.g. @your_channel
 CHANNEL_ID_ENV = os.getenv("TG_CHANNEL_ID")  # e.g. -100...
 CHANNEL_ID = int(CHANNEL_ID_ENV) if CHANNEL_ID_ENV else None
 TARGET_CHAT = CHANNEL if CHANNEL else CHANNEL_ID
-if not TARGET_CHAT:
+
+ARCHIVE_ONLY = os.getenv("POSTBOT_ARCHIVE_ONLY", "0") == "1" or not TARGET_CHAT
+if ARCHIVE_ONLY:
+    logger.info("Режим архива/хранилища включен: публикация отключена, новые медиа сохраняются с AI-подписями")
+elif not TARGET_CHAT:
     logger.critical("Не задан TG_CHANNEL или TG_CHANNEL_ID")
-    raise SystemExit("Set TG_CHANNEL (e.g. @your_channel) or TG_CHANNEL_ID (-100...)")
-logger.info("Работаем с целевым чатом: %s", TARGET_CHAT)
+    raise SystemExit("Set TG_CHANNEL (e.g. @your_channel) or TG_CHANNEL_ID (-100...) or set POSTBOT_ARCHIVE_ONLY=1")
+else:
+    logger.info("Работаем с целевым чатом: %s", TARGET_CHAT)
 
 TZ_NAME = os.getenv("TZ", "Europe/Belgrade")
 TZ = pytz.timezone(TZ_NAME)
@@ -568,17 +573,31 @@ async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Но мы сохранили chat_id в metadata при создании Job
     chat_id = context.job.data.get("chat_id")
     
-    # Сохраняем альбом в активы и спрашиваем платформу
+    # Сохраняем альбом в активы
     payload = json.dumps(items_with_local_paths)
+    ai_caption = await build_ai_caption_for_post("album", payload, caption) if AI_CAPTION_ENABLED else ""
     
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO assets (path, kind, caption, source) VALUES (?, ?, ?, ?)",
-            (payload, "album", caption, "direct")
+            "INSERT INTO assets (path, kind, caption, source, ai_caption) VALUES (?, ?, ?, ?, ?)",
+            (payload, "album", caption, "direct", ai_caption or "")
         )
         asset_id = cur.lastrowid
         await db.commit()
     
+    if ARCHIVE_ONLY:
+        if chat_id:
+            reply_lines = [f"📚 <b>Альбом ({len(items_with_local_paths)} медиа) сохранен в архив</b> (актив #{asset_id})"]
+            if ai_caption:
+                reply_lines.append(f"\n🤖 <b>AI-подпись:</b>\n{ai_caption}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="\n".join(reply_lines),
+                parse_mode=ParseMode.HTML
+            )
+        logger.info("Альбом #%s сохранен в архив (ARCHIVE_ONLY, %d медиа)", asset_id, len(items_with_local_paths))
+        return
+
     context.user_data["pending_post"] = {"kind": "album", "payload": payload, "caption": caption, "asset_id": asset_id}
     
     if chat_id:
@@ -589,7 +608,6 @@ async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         # Если chat_id почему-то нет, просто в очередь (fallback)
-        ai_caption = await build_ai_caption_for_post("album", payload, caption)
         await enqueue(
             "album",
             payload,
@@ -598,13 +616,6 @@ async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
             asset_id=asset_id,
             ai_caption=ai_caption,
         )
-        if ai_caption:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE assets SET ai_caption = ? WHERE id = ?",
-                    (ai_caption, asset_id),
-                )
-                await db.commit()
     logger.info(
         "Альбом media_group_id=%s отправлен в очередь (%d элементов)",
         media_group_id,
@@ -915,8 +926,20 @@ async def fill_missing_captions(limit: int, shard_index: int = 0, shard_total: i
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        slots_txt = ", ".join([s.strftime("%H:%M") for s in DAILY_SLOTS])
         logger.info("Команда /start от %s", _actor(update))
+        if ARCHIVE_ONLY:
+            await update.message.reply_text(
+                "👋 Привет! Я бот для сбора и каталогизации контента.\n\n"
+                "📦 <b>Режим: Локальное хранилище</b> (публикация выключена).\n"
+                "Отправляй мне фото, видео или альбомы — я сохраню их на диск и автоматически сгенерирую AI-подписи.\n\n"
+                "Команды:\n"
+                "• /health — статус хранилища и количество материалов\n"
+                "• /fill_captions [N] — дозаполнить AI-подписи для материалов",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        slots_txt = ", ".join([s.strftime("%H:%M") for s in DAILY_SLOTS])
         await update.message.reply_text(
             "Привет! Кидай мне текст, фото или видео с подписью — я поставлю в очередь.\n"
             f"Публикую в канале по слотам: {slots_txt} ({TZ_NAME}).\n"
@@ -955,7 +978,8 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 preview_src = it.caption if has_caption else it.payload
                 preview = (preview_src or "").replace("\n", " ")[:70]
             lines.append(f"{icon} #{it.id}  {preview}")
-        await update.message.reply_text("Ближайшие посты:\n" + "\n".join(lines))
+        prefix = "⏸️ <b>Публикация на паузе (режим архива)</b>\n" if ARCHIVE_ONLY else ""
+        await update.message.reply_text(f"{prefix}Ближайшие посты в очереди:\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.exception("Ошибка в cmd_queue: %s", e)
         await update.message.reply_text("⚠️ Ошибка при чтении очереди.")
@@ -963,7 +987,22 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         logger.info("Команда /health от %s", _actor(update))
-        size = await queue_size()
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COUNT(*) FROM assets") as cur:
+                total_assets = (await cur.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM queue") as cur:
+                size = (await cur.fetchone())[0]
+        
+        if ARCHIVE_ONLY:
+            await update.message.reply_text(
+                f"🟢 <b>Бот активен в режиме хранилища</b>\n\n"
+                f"• Публикация: <b>отключена</b>\n"
+                f"• Всего материалов в архиве: <b>{total_assets}</b>\n"
+                f"• Постов в очереди ожидания: <b>{size}</b>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
         now_local = datetime.now(TZ)
         slot = _compute_next_slot(now_local)
         slot_txt = slot.strftime("%H:%M") if slot else "—"
@@ -979,6 +1018,10 @@ async def cmd_publish_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Принудительно публикует следующий элемент из очереди прямо сейчас.
     """
     logger.info("Команда /publish_now от %s", _actor(update))
+    if ARCHIVE_ONLY:
+        await update.message.reply_text("⚠️ Публикация отключена (бот работает в режиме архива).")
+        return
+
     size = await queue_size()
     if size == 0:
         await update.message.reply_text("Очередь пуста, нечего публиковать 🤷‍♂️")
@@ -1082,6 +1125,22 @@ async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
     logger.info("Получен текст от %s (длина=%d)", _actor(update), len(text))
+    
+    if ARCHIVE_ONLY:
+        ai_caption = await build_ai_caption_for_post("text", text, "") if AI_CAPTION_ENABLED else ""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "INSERT INTO assets (path, kind, caption, source, ai_caption) VALUES (?, ?, ?, ?, ?)",
+                ("", "text", text, "direct", ai_caption or "")
+            )
+            asset_id = cur.lastrowid
+            await db.commit()
+        reply_lines = [f"🧾 <b>Текст сохранен в архив</b> (актив #{asset_id})"]
+        if ai_caption:
+            reply_lines.append(f"\n🤖 <b>AI-подпись:</b>\n{ai_caption}")
+        await update.message.reply_text("\n".join(reply_lines), parse_mode=ParseMode.HTML)
+        return
+
     context.user_data["pending_post"] = {
         "kind": "text",
         "payload": text,
@@ -1168,16 +1227,24 @@ async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     path = await save_media_locally(context.bot, photo.file_id, "photo")
+    ai_caption = await build_ai_caption_for_post("photo", path, caption) if AI_CAPTION_ENABLED else ""
     
     # Сохраняем в активы "золотого фонда"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO assets (path, kind, caption, source) VALUES (?, ?, ?, ?)",
-            (path, "photo", caption, "direct")
+            "INSERT INTO assets (path, kind, caption, source, ai_caption) VALUES (?, ?, ?, ?, ?)",
+            (path, "photo", caption, "direct", ai_caption or "")
         )
         asset_id = cur.lastrowid
         await db.commit()
     
+    if ARCHIVE_ONLY:
+        reply_lines = [f"🖼️ <b>Фото сохранено в архив</b> (актив #{asset_id})"]
+        if ai_caption:
+            reply_lines.append(f"\n🤖 <b>AI-подпись:</b>\n{ai_caption}")
+        await update.message.reply_text("\n".join(reply_lines), parse_mode=ParseMode.HTML)
+        return
+
     # Вместо немедленной очереди — спрашиваем
     context.user_data["pending_post"] = {"kind": "photo", "payload": path, "caption": caption, "asset_id": asset_id}
     await update.message.reply_text(
@@ -1195,14 +1262,22 @@ async def h_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     path = await save_media_locally(context.bot, video.file_id, "video")
+    ai_caption = await build_ai_caption_for_post("video", path, caption) if AI_CAPTION_ENABLED else ""
     
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO assets (path, kind, caption, source) VALUES (?, ?, ?, ?)",
-            (path, "video", caption, "direct")
+            "INSERT INTO assets (path, kind, caption, source, ai_caption) VALUES (?, ?, ?, ?, ?)",
+            (path, "video", caption, "direct", ai_caption or "")
         )
         asset_id = cur.lastrowid
         await db.commit()
+
+    if ARCHIVE_ONLY:
+        reply_lines = [f"📹 <b>Видео сохранено в архив</b> (актив #{asset_id})"]
+        if ai_caption:
+            reply_lines.append(f"\n🤖 <b>AI-подпись:</b>\n{ai_caption}")
+        await update.message.reply_text("\n".join(reply_lines), parse_mode=ParseMode.HTML)
+        return
 
     context.user_data["pending_post"] = {"kind": "video", "payload": path, "caption": caption, "asset_id": asset_id}
     await update.message.reply_text(
@@ -1217,6 +1292,9 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
     One message per slot. If queue empty — do nothing.
     On error: return item back to queue (tail) and backoff.
     """
+    if ARCHIVE_ONLY:
+        logger.debug("Публикация пропущена: активен режим ARCHIVE_ONLY")
+        return
     item = await dequeue()
     if not item:
         logger.debug("Очередь пуста — публикация пропущена")
@@ -1434,14 +1512,17 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), h_text))
 
     # ежедневные слоты
-    for t in DAILY_SLOTS:
-        app.job_queue.run_daily(
-            publish_next,
-            time=t,  # tz-aware: respect TZ
-            days=(0, 1, 2, 3, 4, 5, 6),     # каждый день
-            name=f"slot_{t.strftime('%H%M')}"
-        )
-    logger.info("Планировщик инициализирован: %d слотов", len(DAILY_SLOTS))
+    if not ARCHIVE_ONLY:
+        for t in DAILY_SLOTS:
+            app.job_queue.run_daily(
+                publish_next,
+                time=t,  # tz-aware: respect TZ
+                days=(0, 1, 2, 3, 4, 5, 6),     # каждый день
+                name=f"slot_{t.strftime('%H%M')}"
+            )
+        logger.info("Планировщик инициализирован: %d слотов", len(DAILY_SLOTS))
+    else:
+        logger.info("Планировщик публикаций отключен (режим ARCHIVE_ONLY)")
 
     # Планируем отчет за 30 минут до первого слота
     if DAILY_SLOTS:

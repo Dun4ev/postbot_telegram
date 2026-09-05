@@ -24,6 +24,7 @@ python bot.py
 - `TG_CHANNEL` или `TG_CHANNEL_ID` — целевой канал.
 - `POSTBOT_STORAGE_DIR` — путь к папке хранения (дефолт: `storage`).
 - `POSTBOT_DB_PATH` — путь к SQLite-базе очереди (дефолт: `queue.db`; в Docker используется `/data/queue.db`).
+- `POSTBOT_ARCHIVE_ONLY` — режим локального накопителя/хранилища (1 — отключить публикацию и просто сохранять все входящие медиа в `storage/` с AI-подписями в `assets`).
 - `POSTBOT_ADMIN_ID` — Telegram ID администратора для получения ежедневных отчетов.
 - `POSTBOT_AUTO_SYNC` — включить автоматическое сканирование папки `storage` при старте (1 или 0).
 - `POSTBOT_AI_CAPTION` — включить короткую AI-подпись для Telegram и X.com (1 или 0).
@@ -36,6 +37,7 @@ python bot.py
 - `POST_SLOTS` — список времён публикации (формат `HH:MM,HH:MM`).
 - `X_ENABLED` — включить публикацию в X (1 или 0).
 - `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET`, `X_BEARER_TOKEN` — ключи X API.
+- `POSTBOT_SIGNATURE` — глобальная подпись для публикаций в X.com (поддерживает ссылки и хэштеги, добавляется автоматически и защищена от обрезки).
 
 Полный список параметров см. в `.env.example`.
 Очередь хранится в `queue.db` в корне проекта.

@@ -54,6 +54,7 @@ from dotenv import load_dotenv, find_dotenv  # NEW
 load_dotenv(find_dotenv())                   # NEW: подхватить .env из текущей папки
 
 import x_publisher  # NEW: интеграция с X
+from x_publisher import x_weighted_length, trim_to_x_limit, X_POST_LIMIT, URL_RE
 # если .env лежит не рядом со скриптом:
 # load_dotenv("/полный/путь/к/.env")
 
@@ -134,10 +135,15 @@ CHANNEL = os.getenv("TG_CHANNEL")  # e.g. @your_channel
 CHANNEL_ID_ENV = os.getenv("TG_CHANNEL_ID")  # e.g. -100...
 CHANNEL_ID = int(CHANNEL_ID_ENV) if CHANNEL_ID_ENV else None
 TARGET_CHAT = CHANNEL if CHANNEL else CHANNEL_ID
-if not TARGET_CHAT:
+
+ARCHIVE_ONLY = os.getenv("POSTBOT_ARCHIVE_ONLY", "0") == "1" or not TARGET_CHAT
+if ARCHIVE_ONLY:
+    logger.info("Режим архива/хранилища включен: публикация отключена, новые медиа сохраняются с AI-подписями")
+elif not TARGET_CHAT:
     logger.critical("Не задан TG_CHANNEL или TG_CHANNEL_ID")
-    raise SystemExit("Set TG_CHANNEL (e.g. @your_channel) or TG_CHANNEL_ID (-100...)")
-logger.info("Работаем с целевым чатом: %s", TARGET_CHAT)
+    raise SystemExit("Set TG_CHANNEL (e.g. @your_channel) or TG_CHANNEL_ID (-100...) or set POSTBOT_ARCHIVE_ONLY=1")
+else:
+    logger.info("Работаем с целевым чатом: %s", TARGET_CHAT)
 
 TZ_NAME = os.getenv("TZ", "Europe/Belgrade")
 TZ = pytz.timezone(TZ_NAME)
@@ -178,9 +184,6 @@ AI_STYLE = os.getenv(
 ).strip()
 AI_TIMEOUT = float(os.getenv("POSTBOT_AI_TIMEOUT", os.getenv("POSTBOT_X_AI_TIMEOUT", "8")))
 AI_MAX_CHARS = _safe_int_env("POSTBOT_AI_MAX_CHARS", _safe_int_env("POSTBOT_X_AI_MAX_CHARS", 180))
-X_POST_LIMIT = 280
-X_URL_LENGTH = 23
-URL_RE = re.compile(r"https?://\S+")
 QUOTED_TEXT_RE = re.compile(r"[\"“”']([^\"“”']{3,180})[\"“”']")
 FALLBACK_CAPTIONS = [
     "What do you think? 💕",
@@ -200,31 +203,24 @@ class AIRateLimitError(RuntimeError):
     """AI API вернул rate limit, продолжать текущую порцию не нужно."""
 
 
-def _x_weighted_length(text: str) -> int:
-    """
-    Приближенно считает длину X-поста: URL занимают 23 символа.
-    Эмодзи и редкие Unicode-символы считаем с небольшим запасом.
-    """
-    total = len(text)
-    for url in URL_RE.findall(text):
-        total += X_URL_LENGTH - len(url)
-    total += sum(1 for char in text if ord(char) > 0xFFFF)
-    return total
+POSTBOT_SIGNATURE = os.getenv("POSTBOT_SIGNATURE", "").replace(r"\n", "\n")
 
-
-def _trim_to_x_limit(text: str, limit: int = X_POST_LIMIT) -> str:
+def _apply_x_signature(caption: str) -> str:
     """
-    Обрезает текст до лимита X без разрыва URL-правила точным алгоритмом.
+    Добавляет POSTBOT_SIGNATURE к подписи для X.com,
+    предварительно обрезая подпись так, чтобы всё вместе уместилось в 280 символов.
     """
-    text = (text or "").strip()
-    if _x_weighted_length(text) <= limit:
-        return text
+    caption = (caption or "").strip()
+    if not POSTBOT_SIGNATURE:
+        return trim_to_x_limit(caption)
 
-    ellipsis = "..."
-    trimmed = text
-    while trimmed and _x_weighted_length(f"{trimmed}{ellipsis}") > limit:
-        trimmed = trimmed[:-1].rstrip()
-    return f"{trimmed}{ellipsis}" if trimmed else ""
+    sig_len = x_weighted_length(POSTBOT_SIGNATURE)
+    allowed_caption_len = max(0, X_POST_LIMIT - sig_len)
+    
+    trimmed_caption = trim_to_x_limit(caption, allowed_caption_len)
+    if trimmed_caption:
+        return f"{trimmed_caption}{POSTBOT_SIGNATURE}"
+    return POSTBOT_SIGNATURE
 
 
 def _sanitize_ai_caption(text: str) -> str:
@@ -339,7 +335,7 @@ def _request_ai_caption_sync(source_text: str, max_chars: int) -> Optional[str]:
         return None
 
     caption = _sanitize_ai_caption(content)
-    return _trim_to_x_limit(caption, max_chars) if caption else None
+    return trim_to_x_limit(caption, max_chars) if caption else None
 
 
 async def build_ai_caption_for_post(kind: str, payload: str, caption: str = "") -> str:
@@ -358,17 +354,18 @@ async def build_ai_caption_for_post(kind: str, payload: str, caption: str = "") 
     if not generated_caption and kind != "text":
         generated_caption = _fallback_caption(payload)
 
-    return _trim_to_x_limit(generated_caption)
+    return trim_to_x_limit(generated_caption)
 
 
 async def build_ai_caption(item: "QueueItem") -> str:
     """
-    Возвращает сохраненную AI-подпись или обычный текст старого элемента.
+    Возвращает сохраненную AI-подпись или обычный текст старого элемента,
+    с добавлением глобальной подписи для X.com.
     """
     if item.ai_caption:
-        return _trim_to_x_limit(item.ai_caption)
+        return _apply_x_signature(item.ai_caption)
     source_text = item.payload if item.kind == "text" else item.caption
-    return _trim_to_x_limit(source_text)
+    return _apply_x_signature(source_text)
 
 DAILY_SLOTS = _parse_slots_from_env()
 logger.info(
@@ -576,17 +573,31 @@ async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Но мы сохранили chat_id в metadata при создании Job
     chat_id = context.job.data.get("chat_id")
     
-    # Сохраняем альбом в активы и спрашиваем платформу
+    # Сохраняем альбом в активы
     payload = json.dumps(items_with_local_paths)
+    ai_caption = await build_ai_caption_for_post("album", payload, caption) if AI_CAPTION_ENABLED else ""
     
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO assets (path, kind, caption, source) VALUES (?, ?, ?, ?)",
-            (payload, "album", caption, "direct")
+            "INSERT INTO assets (path, kind, caption, source, ai_caption) VALUES (?, ?, ?, ?, ?)",
+            (payload, "album", caption, "direct", ai_caption or "")
         )
         asset_id = cur.lastrowid
         await db.commit()
     
+    if ARCHIVE_ONLY:
+        if chat_id:
+            reply_lines = [f"📚 <b>Альбом ({len(items_with_local_paths)} медиа) сохранен в архив</b> (актив #{asset_id})"]
+            if ai_caption:
+                reply_lines.append(f"\n🤖 <b>AI-подпись:</b>\n{ai_caption}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="\n".join(reply_lines),
+                parse_mode=ParseMode.HTML
+            )
+        logger.info("Альбом #%s сохранен в архив (ARCHIVE_ONLY, %d медиа)", asset_id, len(items_with_local_paths))
+        return
+
     context.user_data["pending_post"] = {"kind": "album", "payload": payload, "caption": caption, "asset_id": asset_id}
     
     if chat_id:
@@ -597,7 +608,6 @@ async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         # Если chat_id почему-то нет, просто в очередь (fallback)
-        ai_caption = await build_ai_caption_for_post("album", payload, caption)
         await enqueue(
             "album",
             payload,
@@ -606,13 +616,6 @@ async def _flush_album_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
             asset_id=asset_id,
             ai_caption=ai_caption,
         )
-        if ai_caption:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE assets SET ai_caption = ? WHERE id = ?",
-                    (ai_caption, asset_id),
-                )
-                await db.commit()
     logger.info(
         "Альбом media_group_id=%s отправлен в очередь (%d элементов)",
         media_group_id,
@@ -923,8 +926,20 @@ async def fill_missing_captions(limit: int, shard_index: int = 0, shard_total: i
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        slots_txt = ", ".join([s.strftime("%H:%M") for s in DAILY_SLOTS])
         logger.info("Команда /start от %s", _actor(update))
+        if ARCHIVE_ONLY:
+            await update.message.reply_text(
+                "👋 Привет! Я бот для сбора и каталогизации контента.\n\n"
+                "📦 <b>Режим: Локальное хранилище</b> (публикация выключена).\n"
+                "Отправляй мне фото, видео или альбомы — я сохраню их на диск и автоматически сгенерирую AI-подписи.\n\n"
+                "Команды:\n"
+                "• /health — статус хранилища и количество материалов\n"
+                "• /fill_captions [N] — дозаполнить AI-подписи для материалов",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        slots_txt = ", ".join([s.strftime("%H:%M") for s in DAILY_SLOTS])
         await update.message.reply_text(
             "Привет! Кидай мне текст, фото или видео с подписью — я поставлю в очередь.\n"
             f"Публикую в канале по слотам: {slots_txt} ({TZ_NAME}).\n"
@@ -963,7 +978,8 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 preview_src = it.caption if has_caption else it.payload
                 preview = (preview_src or "").replace("\n", " ")[:70]
             lines.append(f"{icon} #{it.id}  {preview}")
-        await update.message.reply_text("Ближайшие посты:\n" + "\n".join(lines))
+        prefix = "⏸️ <b>Публикация на паузе (режим архива)</b>\n" if ARCHIVE_ONLY else ""
+        await update.message.reply_text(f"{prefix}Ближайшие посты в очереди:\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.exception("Ошибка в cmd_queue: %s", e)
         await update.message.reply_text("⚠️ Ошибка при чтении очереди.")
@@ -971,7 +987,22 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         logger.info("Команда /health от %s", _actor(update))
-        size = await queue_size()
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COUNT(*) FROM assets") as cur:
+                total_assets = (await cur.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM queue") as cur:
+                size = (await cur.fetchone())[0]
+        
+        if ARCHIVE_ONLY:
+            await update.message.reply_text(
+                f"🟢 <b>Бот активен в режиме хранилища</b>\n\n"
+                f"• Публикация: <b>отключена</b>\n"
+                f"• Всего материалов в архиве: <b>{total_assets}</b>\n"
+                f"• Постов в очереди ожидания: <b>{size}</b>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
         now_local = datetime.now(TZ)
         slot = _compute_next_slot(now_local)
         slot_txt = slot.strftime("%H:%M") if slot else "—"
@@ -987,6 +1018,10 @@ async def cmd_publish_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Принудительно публикует следующий элемент из очереди прямо сейчас.
     """
     logger.info("Команда /publish_now от %s", _actor(update))
+    if ARCHIVE_ONLY:
+        await update.message.reply_text("⚠️ Публикация отключена (бот работает в режиме архива).")
+        return
+
     size = await queue_size()
     if size == 0:
         await update.message.reply_text("Очередь пуста, нечего публиковать 🤷‍♂️")
@@ -1090,6 +1125,22 @@ async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
     logger.info("Получен текст от %s (длина=%d)", _actor(update), len(text))
+    
+    if ARCHIVE_ONLY:
+        ai_caption = await build_ai_caption_for_post("text", text, "") if AI_CAPTION_ENABLED else ""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "INSERT INTO assets (path, kind, caption, source, ai_caption) VALUES (?, ?, ?, ?, ?)",
+                ("", "text", text, "direct", ai_caption or "")
+            )
+            asset_id = cur.lastrowid
+            await db.commit()
+        reply_lines = [f"🧾 <b>Текст сохранен в архив</b> (актив #{asset_id})"]
+        if ai_caption:
+            reply_lines.append(f"\n🤖 <b>AI-подпись:</b>\n{ai_caption}")
+        await update.message.reply_text("\n".join(reply_lines), parse_mode=ParseMode.HTML)
+        return
+
     context.user_data["pending_post"] = {
         "kind": "text",
         "payload": text,
@@ -1176,16 +1227,24 @@ async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     path = await save_media_locally(context.bot, photo.file_id, "photo")
+    ai_caption = await build_ai_caption_for_post("photo", path, caption) if AI_CAPTION_ENABLED else ""
     
     # Сохраняем в активы "золотого фонда"
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO assets (path, kind, caption, source) VALUES (?, ?, ?, ?)",
-            (path, "photo", caption, "direct")
+            "INSERT INTO assets (path, kind, caption, source, ai_caption) VALUES (?, ?, ?, ?, ?)",
+            (path, "photo", caption, "direct", ai_caption or "")
         )
         asset_id = cur.lastrowid
         await db.commit()
     
+    if ARCHIVE_ONLY:
+        reply_lines = [f"🖼️ <b>Фото сохранено в архив</b> (актив #{asset_id})"]
+        if ai_caption:
+            reply_lines.append(f"\n🤖 <b>AI-подпись:</b>\n{ai_caption}")
+        await update.message.reply_text("\n".join(reply_lines), parse_mode=ParseMode.HTML)
+        return
+
     # Вместо немедленной очереди — спрашиваем
     context.user_data["pending_post"] = {"kind": "photo", "payload": path, "caption": caption, "asset_id": asset_id}
     await update.message.reply_text(
@@ -1203,14 +1262,22 @@ async def h_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     path = await save_media_locally(context.bot, video.file_id, "video")
+    ai_caption = await build_ai_caption_for_post("video", path, caption) if AI_CAPTION_ENABLED else ""
     
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO assets (path, kind, caption, source) VALUES (?, ?, ?, ?)",
-            (path, "video", caption, "direct")
+            "INSERT INTO assets (path, kind, caption, source, ai_caption) VALUES (?, ?, ?, ?, ?)",
+            (path, "video", caption, "direct", ai_caption or "")
         )
         asset_id = cur.lastrowid
         await db.commit()
+
+    if ARCHIVE_ONLY:
+        reply_lines = [f"📹 <b>Видео сохранено в архив</b> (актив #{asset_id})"]
+        if ai_caption:
+            reply_lines.append(f"\n🤖 <b>AI-подпись:</b>\n{ai_caption}")
+        await update.message.reply_text("\n".join(reply_lines), parse_mode=ParseMode.HTML)
+        return
 
     context.user_data["pending_post"] = {"kind": "video", "payload": path, "caption": caption, "asset_id": asset_id}
     await update.message.reply_text(
@@ -1225,6 +1292,9 @@ async def publish_next(context: ContextTypes.DEFAULT_TYPE):
     One message per slot. If queue empty — do nothing.
     On error: return item back to queue (tail) and backoff.
     """
+    if ARCHIVE_ONLY:
+        logger.debug("Публикация пропущена: активен режим ARCHIVE_ONLY")
+        return
     item = await dequeue()
     if not item:
         logger.debug("Очередь пуста — публикация пропущена")
@@ -1442,14 +1512,17 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), h_text))
 
     # ежедневные слоты
-    for t in DAILY_SLOTS:
-        app.job_queue.run_daily(
-            publish_next,
-            time=t,  # tz-aware: respect TZ
-            days=(0, 1, 2, 3, 4, 5, 6),     # каждый день
-            name=f"slot_{t.strftime('%H%M')}"
-        )
-    logger.info("Планировщик инициализирован: %d слотов", len(DAILY_SLOTS))
+    if not ARCHIVE_ONLY:
+        for t in DAILY_SLOTS:
+            app.job_queue.run_daily(
+                publish_next,
+                time=t,  # tz-aware: respect TZ
+                days=(0, 1, 2, 3, 4, 5, 6),     # каждый день
+                name=f"slot_{t.strftime('%H%M')}"
+            )
+        logger.info("Планировщик инициализирован: %d слотов", len(DAILY_SLOTS))
+    else:
+        logger.info("Планировщик публикаций отключен (режим ARCHIVE_ONLY)")
 
     # Планируем отчет за 30 минут до первого слота
     if DAILY_SLOTS:
