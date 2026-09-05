@@ -1550,12 +1550,13 @@ def main():
         
         logger.info("Старт long-polling...")
         # run_polling блокирует поток до завершения работы приложения
+        drop_pending = os.getenv("POSTBOT_DROP_PENDING_UPDATES", "0") == "1"
         app.run_polling(
             poll_interval=0.0,
             timeout=25,
             read_timeout=35,
             allowed_updates=["message", "callback_query"],
-            drop_pending_updates=True
+            drop_pending_updates=drop_pending
         )
     except Exception:
         logger.exception("Критическая ошибка при работе бота")
